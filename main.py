@@ -16,7 +16,7 @@ from discord_commands import setup_commands
 # 기본 설정
 # =========================
 
-TTS_CHANNELS_FILE = "tts_channels.json"
+TTS_CHANNELS_FILE = "data/tts_channels.json"
 
 GUILD_IDS = [
     1499995640288116838,
@@ -75,6 +75,8 @@ def load_tts_channels():
 
 def save_tts_channels():
     try:
+        os.makedirs(os.path.dirname(TTS_CHANNELS_FILE), exist_ok=True)
+
         with open(TTS_CHANNELS_FILE, "w", encoding="utf-8") as f:
             json.dump(tts_channels, f, ensure_ascii=False, indent=4)
 

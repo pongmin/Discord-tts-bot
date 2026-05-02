@@ -1,12 +1,43 @@
 import asyncio
+from fileinput import filename
 import os
 import time
+import aiohttp
+import urllib.parse
 import discord
 import pathlib
 import tempfile
 from gtts import gTTS
 from tts_text import clean_tts_text
+import json
 
+USER_TTS_SETTINGS_FILE = "user_tts_settings.json"
+
+def load_user_tts_settings():
+    if not os.path.exists(USER_TTS_SETTINGS_FILE):
+        return {}
+
+    try:
+        with open(USER_TTS_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        return {int(user_id): setting for user_id, setting in data.items()}
+
+    except Exception as e:
+        print("유저 TTS 설정 로드 실패:", repr(e))
+        return {}
+
+
+def save_user_tts_settings():
+    try:
+        with open(USER_TTS_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(USER_TTS_SETTINGS, f, ensure_ascii=False, indent=4)
+
+    except Exception as e:
+        print("유저 TTS 설정 저장 실패:", repr(e))
+
+
+USER_TTS_SETTINGS = load_user_tts_settings()
 
 MAX_QUEUE_SIZE = 15
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
@@ -23,12 +54,27 @@ tts_locks = {}    # guild_id -> asyncio.Lock
 # TTS 파일 생성
 # =========================
 
-async def make_tts_file(text: str, filename: str):
-    def save():
-        tts = gTTS(text=text, lang="ko")
-        tts.save(filename)
+async def make_tts_file(text: str, filename: str, engine="gtts", voice="Kim"):
 
-    await asyncio.to_thread(save)
+    if engine == "gtts":
+        from gtts import gTTS
+
+        def save():
+            tts = gTTS(text=text, lang="ko")
+            tts.save(filename)
+
+        await asyncio.to_thread(save)
+
+    elif engine == "se":
+        encoded = urllib.parse.quote(text)
+        url = f"https://api.streamelements.com/kappa/v2/speech?voice={voice}&text={encoded}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.read()
+
+        with open(filename, "wb") as f:
+            f.write(data)
 
 
 # =========================
@@ -115,7 +161,19 @@ async def play_tts_queue(bot, guild: discord.Guild, lock: asyncio.Lock):
                 filename = str(TTS_DIR / f"tts_{guild_id}_{message.id}.mp3")
 
                 try:
-                    await make_tts_file(text, filename)
+                    user_id = message.author.id
+
+                    setting = USER_TTS_SETTINGS.get(
+                        user_id,
+                        {"engine": "gtts"}
+                    )
+
+                    await make_tts_file(
+                        text,
+                        filename,
+                        engine=setting.get("engine", "gtts"),
+                        voice=setting.get("voice", "Kim")
+                    )
 
                     audio_source = discord.FFmpegPCMAudio(
                         filename,
@@ -132,10 +190,15 @@ async def play_tts_queue(bot, guild: discord.Guild, lock: asyncio.Lock):
 
                     voice_client.play(audio_source, after=after_playing)
 
-                    print(f"TTS 재생: {message.author}: {text}")
+                    print(
+                        f"TTS 재생: {message.author}: {text} "
+                        f"[engine={setting.get('engine', 'gtts')}, "
+                        f"voice={setting.get('voice', '-')}]"
+                    )
 
                     await done.wait()
-                    await asyncio.sleep(0.03)
+
+                    await asyncio.sleep(0.05)
 
                 except Exception as e:
                     print("TTS ERROR:", repr(e))
@@ -144,6 +207,7 @@ async def play_tts_queue(bot, guild: discord.Guild, lock: asyncio.Lock):
                     try:
                         if os.path.exists(filename):
                             os.remove(filename)
+
                     except Exception as e:
                         print("파일 삭제 실패:", repr(e))
 

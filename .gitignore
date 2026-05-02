@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 discord.log
 tts_channels.json
-*.mp3dir /a
+*.mp3dir /agit rm --cached .env
+user_tts_settings.json

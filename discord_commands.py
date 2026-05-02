@@ -1,6 +1,6 @@
 import discord
 import asyncio
-
+from tts_voice import USER_TTS_SETTINGS, save_user_tts_settings
 
 def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
 
@@ -120,6 +120,26 @@ def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
                 ephemeral=True
             )
 
+    @bot.tree.command(
+        name="voice",
+        description="TTS 목소리를 변경합니다 (기본 / 테스트)"
+    )
+    async def voice(interaction: discord.Interaction, mode: str):
+
+        user_id = interaction.user.id
+
+        if mode == "기본":
+            USER_TTS_SETTINGS[user_id] = {"engine": "gtts"}
+            save_user_tts_settings()
+            await interaction.response.send_message("gTTS로 설정됨")
+
+        elif mode == "테스트":
+            USER_TTS_SETTINGS[user_id] = {"engine": "se", "voice": "Kim"}
+            save_user_tts_settings()
+            await interaction.response.send_message("StreamElements 목소리로 설정됨")
+
+        else:
+            await interaction.response.send_message("옵션: 기본 / 테스트")
 
     @bot.tree.command(
         name="clearqueue",

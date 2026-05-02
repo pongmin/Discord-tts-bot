@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+discord.log
+tts_channels.json
+*.mp3dir /a

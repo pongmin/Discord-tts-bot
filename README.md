@@ -15,6 +15,7 @@ Discord TTS Bot
 설치 방법
 
 pip install -r requirements.txt
+
 python main.py
 
 환경 설정

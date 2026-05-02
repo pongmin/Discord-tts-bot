@@ -122,7 +122,7 @@ def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
 
     @bot.tree.command(
         name="voice",
-        description="TTS 목소리를 변경합니다 (기본 / 테스트)"
+        description="쓰지마세요 테스트중임 바꾸면 소리 안나옴"
     )
     async def voice(interaction: discord.Interaction, mode: str):
 

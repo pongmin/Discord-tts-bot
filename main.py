@@ -29,9 +29,19 @@ KEYWORD_REACTIONS = [
         "responses": ["?"],
         "prob": 0.2
     },
-    {
+    {   
         "keyword": ";;",
         "responses": [";;"],
+        "prob": 0.2
+    },
+    {   
+        "keyword": "안",
+        "responses": ["물어봄"],
+        "prob": 0.2
+    },
+        {   
+        "keyword": "볼때마다",
+        "responses": ["죽어있네"],
         "prob": 0.2
     }
 ]

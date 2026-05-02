@@ -1,4 +1,7 @@
-discord.py
+discord.py[voice]
 python-dotenv
-gtts
-pyNaCl
+gTTS
+requests
+edge-tts
+aiohttp
+audioop-lts

@@ -47,7 +47,7 @@ KEYWORD_REACTIONS = [
     {
         "keyword": "좆 메 바",
         "responses": ["씹 메 바"],
-        "prob": 0.4
+        "prob": 0.3
     },
     {
         "keyword": "개동민",
@@ -67,17 +67,17 @@ KEYWORD_REACTIONS = [
     {
         "keyword": "좆메바",
         "responses": ["씹 메 바", "개 메 바"],
-        "prob": 0.4
+        "prob": 0.3
     },
     {
         "keyword": "ㅇㅅㅇ",
         "responses": ["ㅇㅅㅇ", "밍", "느엥"],
-        "prob": 0.4
+        "prob": 0.3
     },
     {
         "keyword": "좆풍",
         "responses": ["씹풍", "좆풍", "개풍"],
-        "prob": 0.4
+        "prob": 0.3
     }
     
 ]

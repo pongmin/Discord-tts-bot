@@ -48,8 +48,22 @@ KEYWORD_REACTIONS = [
         "keyword": "좆 메 바",
         "responses": ["씹 메 바"],
         "prob": 0.4
+    },
+    {
+        "keyword": "개동민",
+        "responses": ["죽어"],
+        "prob": 0.4
+    },
+    {
+        "keyword": "🥀",
+        "responses": ["💔"],
+        "prob": 0.4
+    },
+    {
+        "keyword": "악짱",
+        "responses": ["🤝"],
+        "prob": 0.4
     }
-
 ]
 
 reaction_last_used = {}

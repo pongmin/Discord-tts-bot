@@ -37,13 +37,19 @@ KEYWORD_REACTIONS = [
     {   
         "keyword": "안",
         "responses": ["물어봄"],
-        "prob": 0.2
+        "prob": 0.5
     },
-        {   
+    {   
         "keyword": "볼때마다",
         "responses": ["죽어있네"],
-        "prob": 0.2
+        "prob": 0.4
+    },
+    {
+        "keyword": "좆 메 바",
+        "responses": ["씹 메 바"],
+        "prob": 0.4
     }
+
 ]
 
 reaction_last_used = {}

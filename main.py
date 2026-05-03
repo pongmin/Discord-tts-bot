@@ -63,7 +63,13 @@ KEYWORD_REACTIONS = [
         "keyword": "악짱",
         "responses": ["🤝"],
         "prob": 0.4
+    },    
+    {
+        "keyword": "좆메바",
+        "responses": ["씹 메 바", "개 메 바"],
+        "prob": 0.4
     }
+    
 ]
 
 reaction_last_used = {}

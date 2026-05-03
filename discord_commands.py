@@ -1,7 +1,7 @@
 import discord
 import asyncio
 from discord import app_commands
-
+import random
 from tts_voice import USER_TTS_SETTINGS, save_user_tts_settings
 
 from champion_recommend import (
@@ -232,3 +232,41 @@ def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
                 f"챔피언 추천 중 오류가 났어: `{type(e).__name__}: {e}`",
                 ephemeral=True
             )
+    @bot.tree.context_menu(name="이모티콘 폭격")
+    async def emoji_bomb(interaction: discord.Interaction, message: discord.Message):
+        emojis = [
+            "<:Do_The_DIH:1475889811591135292>",
+            "<:IMG_2178:1279441447292112928>",
+            "<:IMG_2316:1310910241688256594>",
+            "<:729d1d80595a4cc50416be1e20008c55:1380475191007907920>",
+            "<:IMG_1931:1225097138736726058>",
+            "<:IMG_2317:1310910517841498133>",
+            "<:emoji_19:1499620472516509807>",
+            "<:GEOBUGI:1475890659952169103>",
+            "<:emoji_34:1375121956952608830>",
+            "<:IMG_2379:1332006874421395526>",
+            "🥀","💔","❓","🧑‍🦽","👎","🤬","🤡"
+        ]
+
+        count = min(8, len(emojis))
+        selected_emojis = random.sample(emojis, k=count)
+
+        await interaction.response.defer(ephemeral=True)
+
+        success = 0
+        failed = 0
+
+        for emoji in selected_emojis:
+            try:
+                await message.add_reaction(emoji)
+                success += 1
+                await asyncio.sleep(0.25)
+
+            except Exception as e:
+                print("REACTION ERROR:", repr(e))
+                failed += 1
+
+        await interaction.followup.send(
+            f"이모티콘 {success}개 달았음" + (f" / 실패 {failed}개" if failed else ""),
+            ephemeral=True
+        )

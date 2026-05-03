@@ -1,6 +1,15 @@
 import discord
 import asyncio
+from discord import app_commands
+
 from tts_voice import USER_TTS_SETTINGS, save_user_tts_settings
+
+from champion_recommend import (
+    pick_random_champion,
+    get_champion_image_url,
+    LANE_DISPLAY,
+    DAMAGE_DISPLAY
+)
 
 def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
 
@@ -169,3 +178,57 @@ def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
             f"큐 {cleared}개 비움",
             ephemeral=True
         )
+    @bot.tree.command(
+        name="추천",
+        description="라인과 AD/AP 조건에 맞는 롤 챔피언을 랜덤 추천합니다."
+    )
+    
+    @app_commands.describe(
+        라인="추천받을 라인",
+        딜타입="AD 또는 AP 선택. 비워두면 전체에서 랜덤 추천"
+    )
+    
+    @app_commands.choices(
+        라인=[
+            app_commands.Choice(name="탑", value="top"),
+            app_commands.Choice(name="정글", value="jungle"),
+            app_commands.Choice(name="미드", value="mid"),
+            app_commands.Choice(name="원딜", value="adc"),
+            app_commands.Choice(name="서폿", value="support")
+        ],
+        딜타입=[
+            app_commands.Choice(name="AD", value="ad"),
+            app_commands.Choice(name="AP", value="ap")
+        ]
+    )
+    async def recommend_champion(
+        interaction: discord.Interaction,
+        라인: app_commands.Choice[str],
+        딜타입: app_commands.Choice[str] | None = None
+    ):
+        lane = 라인.value
+        damage_type = 딜타입.value if 딜타입 is not None else None
+
+        try:
+            champion, picked_damage_type = pick_random_champion(lane, damage_type)
+
+            lane_name = LANE_DISPLAY[lane]
+            damage_name = DAMAGE_DISPLAY[picked_damage_type]
+            image_url = await get_champion_image_url(champion)
+
+            embed = discord.Embed(
+                title="롤 챔피언 추천",
+                description=f"**{lane_name} {damage_name} 추천 챔피언: {champion}**",
+                color=0x5865F2
+            )
+
+            if image_url:
+                embed.set_thumbnail(url=image_url)
+
+            await interaction.response.send_message(embed=embed)
+
+        except Exception as e:
+            await interaction.response.send_message(
+                f"챔피언 추천 중 오류가 났어: `{type(e).__name__}: {e}`",
+                ephemeral=True
+            )

@@ -248,7 +248,7 @@ def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
             "🥀","💔","❓","🧑‍🦽","👎","🤬","🤡"
         ]
 
-        count = min(8, len(emojis))
+        count = min(10, len(emojis))
         selected_emojis = random.sample(emojis, k=count)
 
         await interaction.response.defer(ephemeral=True)
@@ -260,7 +260,7 @@ def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
             try:
                 await message.add_reaction(emoji)
                 success += 1
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.02)
 
             except Exception as e:
                 print("REACTION ERROR:", repr(e))

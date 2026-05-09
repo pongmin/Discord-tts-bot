@@ -1,18 +1,21 @@
 import asyncio
-from fileinput import filename
 import os
 import time
-import aiohttp
-import urllib.parse
 import discord
 import pathlib
 import tempfile
-from gtts import gTTS
-from tts_text import clean_tts_text
 import json
+import urllib.parse
+import aiohttp
 
+from tts_text import clean_tts_text
+
+
+# 🔽 여기 추가
 USER_TTS_SETTINGS_FILE = "user_tts_settings.json"
 
+
+# 🔽 여기도 추가
 def load_user_tts_settings():
     if not os.path.exists(USER_TTS_SETTINGS_FILE):
         return {}
@@ -37,6 +40,7 @@ def save_user_tts_settings():
         print("유저 TTS 설정 저장 실패:", repr(e))
 
 
+# 🔽 여기서 불러오기
 USER_TTS_SETTINGS = load_user_tts_settings()
 
 MAX_QUEUE_SIZE = 15

@@ -1,11 +1,13 @@
+import asyncio
 import json
 import random
+import time
 from pathlib import Path
 
-import aiohttp
+from http_session import get_session
 
 
-LANE_FILE = Path("lane_champions.json")
+LANE_FILE = Path(__file__).resolve().parent / "lane_champions.json"
 
 LANE_DISPLAY = {
     "top": "탑",
@@ -21,13 +23,23 @@ DAMAGE_DISPLAY = {
     "tank": "탱커"
 }
 
+_lane_champions = None
+
 
 def load_lane_champions() -> dict:
-    if not LANE_FILE.exists():
-        raise FileNotFoundError("lane_champions.json 파일을 찾을 수 없습니다.")
+    """
+    챔피언 목록은 자주 안 바뀌므로 한 번만 읽어서 재사용.
+    """
+    global _lane_champions
 
-    with open(LANE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    if _lane_champions is None:
+        if not LANE_FILE.exists():
+            raise FileNotFoundError("lane_champions.json 파일을 찾을 수 없습니다.")
+
+        with open(LANE_FILE, "r", encoding="utf-8") as f:
+            _lane_champions = json.load(f)
+
+    return _lane_champions
 
 
 def pick_random_champion(lane: str, damage_type: str | None = None) -> tuple[str, str]:
@@ -49,11 +61,11 @@ def pick_random_champion(lane: str, damage_type: str | None = None) -> tuple[str
 
         return random.choice(champions), damage_type
 
-    combined_pool = []
-
-    for dtype, champions in lane_pool.items():
-        for champion in champions:
-            combined_pool.append((champion, dtype))
+    combined_pool = [
+        (champion, dtype)
+        for dtype, champions in lane_pool.items()
+        for champion in champions
+    ]
 
     if not combined_pool:
         raise ValueError("해당 라인에 등록된 챔피언이 없습니다.")
@@ -61,34 +73,69 @@ def pick_random_champion(lane: str, damage_type: str | None = None) -> tuple[str
     return random.choice(combined_pool)
 
 
-async def get_latest_lol_version() -> str:
-    url = "https://ddragon.leagueoflegends.com/api/versions.json"
+# =========================
+# Data Dragon 캐시
+# =========================
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            versions = await response.json()
-            return versions[0]
+VERSIONS_URL = "https://ddragon.leagueoflegends.com/api/versions.json"
+
+# 패치는 2주에 한 번 정도라 자주 다시 받을 이유가 없음
+_DDRAGON_TTL = 60 * 60 * 6
+
+_ddragon_lock = asyncio.Lock()
+_ddragon_fetched_at = 0.0
+_ddragon_version: str | None = None
+_ddragon_images: dict[str, str] = {}
 
 
-async def get_champion_data_ko() -> dict:
-    version = await get_latest_lol_version()
+async def _fetch_ddragon() -> None:
+    global _ddragon_fetched_at, _ddragon_version, _ddragon_images
+
+    session = get_session()
+
+    async with session.get(VERSIONS_URL) as response:
+        response.raise_for_status()
+        versions = await response.json()
+
+    version = versions[0]
+
     url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/ko_KR/champion.json"
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            data = await response.json()
-            return data["data"]
+    async with session.get(url) as response:
+        response.raise_for_status()
+        data = await response.json()
+
+    # 매번 전체를 훑지 않도록 한글 이름 -> 이미지 URL로 미리 만들어 둠
+    _ddragon_images = {
+        champion["name"]: (
+            "https://ddragon.leagueoflegends.com/cdn/"
+            f"{version}/img/champion/{champion['image']['full']}"
+        )
+        for champion in data["data"].values()
+    }
+
+    _ddragon_version = version
+    _ddragon_fetched_at = time.monotonic()
+
+
+def _cache_is_fresh() -> bool:
+    return (
+        _ddragon_version is not None
+        and time.monotonic() - _ddragon_fetched_at < _DDRAGON_TTL
+    )
+
+
+async def _ensure_ddragon() -> None:
+    async with _ddragon_lock:
+        # 락을 기다리는 사이에 다른 요청이 이미 채웠을 수 있음
+        if _cache_is_fresh():
+            return
+
+        await _fetch_ddragon()
 
 
 async def get_champion_image_url(champion_name_ko: str) -> str | None:
-    version = await get_latest_lol_version()
-    champion_data = await get_champion_data_ko()
+    if not _cache_is_fresh():
+        await _ensure_ddragon()
 
-    for champion_id, champion in champion_data.items():
-        if champion["name"] == champion_name_ko:
-            image_file = champion["image"]["full"]
-            return f"https://ddragon.leagueoflegends.com/cdn/{version}/img/champion/{image_file}"
-
-    return None
+    return _ddragon_images.get(champion_name_ko)

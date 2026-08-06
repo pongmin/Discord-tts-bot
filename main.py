@@ -6,8 +6,9 @@ import os
 import json
 import random
 import time
-import asyncio
+from pathlib import Path
 
+from http_session import close_session
 from tts_voice import add_tts_queue, add_bot_tts_queue, tts_queues
 from discord_commands import setup_commands
 
@@ -16,7 +17,11 @@ from discord_commands import setup_commands
 # 기본 설정
 # =========================
 
-TTS_CHANNELS_FILE = "data/tts_channels.json"
+BASE_DIR = Path(__file__).resolve().parent
+TTS_CHANNELS_FILE = BASE_DIR / "tts_channels.json"
+
+# 같은 키워드에 다시 반응하기까지의 최소 간격(초)
+REACTION_COOLDOWN = 10
 
 GUILD_IDS = [
     1499995640288116838,
@@ -92,7 +97,7 @@ MY_GUILDS = [discord.Object(id=g) for g in GUILD_IDS]
 # =========================
 
 def load_tts_channels():
-    if not os.path.exists(TTS_CHANNELS_FILE):
+    if not TTS_CHANNELS_FILE.exists():
         return {}
 
     try:
@@ -111,8 +116,6 @@ def load_tts_channels():
 
 def save_tts_channels():
     try:
-        os.makedirs(os.path.dirname(TTS_CHANNELS_FILE), exist_ok=True)
-
         with open(TTS_CHANNELS_FILE, "w", encoding="utf-8") as f:
             json.dump(tts_channels, f, ensure_ascii=False, indent=4)
 
@@ -135,7 +138,7 @@ if token is None:
     raise RuntimeError("DISCORD_TOKEN이 .env 파일에 없음")
 
 handler = logging.FileHandler(
-    filename="discord.log",
+    filename=BASE_DIR / "discord.log",
     encoding="utf-8",
     mode="w"
 )
@@ -144,7 +147,14 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="#", intents=intents)
+
+class StoryBot(commands.Bot):
+    async def close(self):
+        await close_session()
+        await super().close()
+
+
+bot = StoryBot(command_prefix="#", intents=intents)
 
 setup_commands(bot, tts_channels, save_tts_channels, tts_queues)
 
@@ -169,7 +179,7 @@ async def try_keyword_reaction(message: discord.Message):
         now = time.time()
         last = reaction_last_used.get(key, 0)
 
-        if now - last < rule.get("cooldown", 10):
+        if now - last < REACTION_COOLDOWN:
             continue
 
         if random.random() >= rule.get("prob", 0.1):
@@ -183,7 +193,7 @@ async def try_keyword_reaction(message: discord.Message):
 
         # 음성 채널에 있으면 TTS로도 읽기
         if message.guild.voice_client is not None:
-            await add_bot_tts_queue(bot, message.guild, message.channel, response)
+            await add_bot_tts_queue(bot, message.guild, response)
 
         break
 
@@ -232,9 +242,8 @@ async def on_message(message: discord.Message):
         else:
             await add_tts_queue(bot, message)
 
+    # 명령은 전부 슬래시 커맨드라 process_commands()는 부르지 않음
     await try_keyword_reaction(message)
-
-    await bot.process_commands(message)
 
 
 @bot.event
@@ -263,4 +272,4 @@ async def on_voice_state_update(member, before, after):
 # 실행
 # =========================
 
-bot.run(token, log_handler=handler, log_level=logging.DEBUG)
+bot.run(token, log_handler=handler, log_level=logging.INFO)

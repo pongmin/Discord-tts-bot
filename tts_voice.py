@@ -1,23 +1,24 @@
 import asyncio
+import io
 import os
-import time
-import discord
-import pathlib
-import tempfile
 import json
+import pathlib
 import urllib.parse
-import aiohttp
+from dataclasses import dataclass
 
+import discord
+from gtts import gTTS
+
+from http_session import get_session
 from tts_text import clean_tts_text
 
 
-# 🔽 여기 추가
-USER_TTS_SETTINGS_FILE = "user_tts_settings.json"
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+USER_TTS_SETTINGS_FILE = BASE_DIR / "user_tts_settings.json"
 
 
-# 🔽 여기도 추가
 def load_user_tts_settings():
-    if not os.path.exists(USER_TTS_SETTINGS_FILE):
+    if not USER_TTS_SETTINGS_FILE.exists():
         return {}
 
     try:
@@ -40,45 +41,52 @@ def save_user_tts_settings():
         print("유저 TTS 설정 저장 실패:", repr(e))
 
 
-# 🔽 여기서 불러오기
 USER_TTS_SETTINGS = load_user_tts_settings()
 
 MAX_QUEUE_SIZE = 15
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
-TTS_DIR = pathlib.Path(tempfile.gettempdir()) / "discord_tts"
-TTS_DIR.mkdir(exist_ok=True)
+# after 콜백이 끝내 안 불리는 경우에도 큐가 영구히 멈추지 않도록
+MAX_PLAYBACK_SECONDS = 60
 
 tts_queues = {}   # guild_id -> asyncio.Queue
-tts_playing = {}  # guild_id -> bool
-tts_locks = {}    # guild_id -> asyncio.Lock
+tts_workers = {}  # guild_id -> asyncio.Task
+
+
+@dataclass
+class TTSRequest:
+    author_id: int
+    author_name: str
+    text: str
 
 
 # =========================
-# TTS 파일 생성
+# TTS 오디오 생성
 # =========================
 
-async def make_tts_file(text: str, filename: str, engine="gtts", voice="Kim"):
-
-    if engine == "gtts":
-        from gtts import gTTS
-
-        def save():
-            tts = gTTS(text=text, lang="ko")
-            tts.save(filename)
-
-        await asyncio.to_thread(save)
-
-    elif engine == "se":
+async def make_tts_audio(text: str, engine: str = "gtts", voice: str = "Kim") -> bytes:
+    """
+    TTS 결과를 파일이 아니라 바이트로 돌려줌.
+    ffmpeg에 그대로 파이프로 넣을 거라 임시 파일이 필요 없음.
+    """
+    if engine == "se":
         encoded = urllib.parse.quote(text)
-        url = f"https://api.streamelements.com/kappa/v2/speech?voice={voice}&text={encoded}"
+        url = (
+            "https://api.streamelements.com/kappa/v2/speech"
+            f"?voice={voice}&text={encoded}"
+        )
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                data = await resp.read()
+        async with get_session().get(url) as resp:
+            # 에러 페이지를 mp3로 받아서 ffmpeg가 깨지는 걸 막음
+            resp.raise_for_status()
+            return await resp.read()
 
-        with open(filename, "wb") as f:
-            f.write(data)
+    def render() -> bytes:
+        buffer = io.BytesIO()
+        gTTS(text=text, lang="ko").write_to_fp(buffer)
+        return buffer.getvalue()
+
+    return await asyncio.to_thread(render)
 
 
 # =========================
@@ -89,135 +97,118 @@ async def add_tts_queue(bot, message: discord.Message):
     if message.guild is None:
         return
 
-    guild_id = message.guild.id
-    text = clean_tts_text(message.content)
+    _submit(
+        bot,
+        message.guild,
+        message.author.id,
+        str(message.author),
+        message.content
+    )
+
+
+async def add_bot_tts_queue(bot, guild: discord.Guild, text: str):
+    _submit(bot, guild, bot.user.id, str(bot.user), text)
+
+
+def _submit(bot, guild: discord.Guild, author_id: int, author_name: str, raw_text: str):
+    text = clean_tts_text(raw_text)
 
     if not text:
         return
 
     queue = tts_queues.setdefault(
-        guild_id,
+        guild.id,
         asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
     )
 
-    if queue.full():
-        print(f"[{guild_id}] 큐가 가득 참 - 메시지 드랍")
+    try:
+        queue.put_nowait(TTSRequest(author_id, author_name, text))
+
+    except asyncio.QueueFull:
+        print(f"[{guild.id}] 큐가 가득 참 - 메시지 드랍")
         return
 
-    await queue.put((message, text))
+    worker = tts_workers.get(guild.id)
 
-    lock = tts_locks.setdefault(guild_id, asyncio.Lock())
-
-    if not tts_playing.get(guild_id, False):
-        tts_playing[guild_id] = True
-        asyncio.create_task(play_tts_queue(bot, message.guild, lock))
+    if worker is None or worker.done():
+        tts_workers[guild.id] = asyncio.create_task(_tts_worker(guild))
 
 
-async def add_bot_tts_queue(bot, guild: discord.Guild, channel: discord.TextChannel, text: str):
-    guild_id = guild.id
-
-    text = clean_tts_text(text)
-    if not text:
-        return
-
-    queue = tts_queues.setdefault(
-        guild_id,
-        asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+async def _play(voice_client: discord.VoiceClient, audio: bytes):
+    source = discord.FFmpegPCMAudio(
+        io.BytesIO(audio),
+        pipe=True,
+        executable=FFMPEG_PATH
     )
 
-    if queue.full():
-        print(f"[{guild_id}] 큐가 가득 참 - 봇 반응 TTS 드랍")
-        return
+    loop = asyncio.get_running_loop()
+    done = asyncio.Event()
 
-    class BotTTSMessage:
-        def __init__(self, guild, channel, text):
-            self.guild = guild
-            self.channel = channel
-            self.content = text
-            self.id = int(time.time() * 1000)
-            self.author = bot.user
+    def after_playing(error):
+        if error:
+            print("재생 오류:", error)
 
-    fake_message = BotTTSMessage(guild, channel, text)
+        loop.call_soon_threadsafe(done.set)
 
-    await queue.put((fake_message, text))
+    voice_client.play(source, after=after_playing)
 
-    lock = tts_locks.setdefault(guild_id, asyncio.Lock())
+    try:
+        await asyncio.wait_for(done.wait(), timeout=MAX_PLAYBACK_SECONDS)
 
-    if not tts_playing.get(guild_id, False):
-        tts_playing[guild_id] = True
-        asyncio.create_task(play_tts_queue(bot, guild, lock))
+    except asyncio.TimeoutError:
+        print("재생 시간 초과 - 강제 중단")
+        voice_client.stop()
 
 
-async def play_tts_queue(bot, guild: discord.Guild, lock: asyncio.Lock):
+async def _tts_worker(guild: discord.Guild):
+    """
+    길드마다 하나만 도는 소비자. 큐가 비면 종료하고, 새 메시지가 오면 _submit()이 다시 띄움.
+    """
     guild_id = guild.id
+    queue = tts_queues[guild_id]
 
-    async with lock:
-        try:
-            while guild_id in tts_queues and not tts_queues[guild_id].empty():
-                message, text = await tts_queues[guild_id].get()
+    try:
+        while True:
+            try:
+                request = queue.get_nowait()
 
+            except asyncio.QueueEmpty:
+                return
+
+            # 음성 채널에 없으면 굳이 음성을 만들지 않음
+            if guild.voice_client is None:
+                print("봇이 음성채널에 없음")
+                continue
+
+            try:
+                setting = USER_TTS_SETTINGS.get(request.author_id, {})
+                engine = setting.get("engine", "gtts")
+                voice = setting.get("voice", "Kim")
+
+                audio = await make_tts_audio(
+                    request.text,
+                    engine=engine,
+                    voice=voice
+                )
+
+                # 음성 생성을 기다리는 사이에 봇이 나갔을 수 있으므로 재생 직전에 확인
                 voice_client = guild.voice_client
 
-                if voice_client is None:
+                if voice_client is None or not voice_client.is_connected():
                     print("봇이 음성채널에 없음")
                     continue
 
-                filename = str(TTS_DIR / f"tts_{guild_id}_{message.id}.mp3")
+                print(
+                    f"TTS 재생: {request.author_name}: {request.text} "
+                    f"[engine={engine}, voice={voice if engine == 'se' else '-'}]"
+                )
 
-                try:
-                    user_id = message.author.id
+                await _play(voice_client, audio)
+                await asyncio.sleep(0.05)
 
-                    setting = USER_TTS_SETTINGS.get(
-                        user_id,
-                        {"engine": "gtts"}
-                    )
+            except Exception as e:
+                print("TTS ERROR:", repr(e))
 
-                    await make_tts_file(
-                        text,
-                        filename,
-                        engine=setting.get("engine", "gtts"),
-                        voice=setting.get("voice", "Kim")
-                    )
-
-                    audio_source = discord.FFmpegPCMAudio(
-                        filename,
-                        executable=FFMPEG_PATH
-                    )
-
-                    done = asyncio.Event()
-
-                    def after_playing(error):
-                        if error:
-                            print("재생 오류:", error)
-
-                        bot.loop.call_soon_threadsafe(done.set)
-
-                    voice_client.play(audio_source, after=after_playing)
-
-                    print(
-                        f"TTS 재생: {message.author}: {text} "
-                        f"[engine={setting.get('engine', 'gtts')}, "
-                        f"voice={setting.get('voice', '-')}]"
-                    )
-
-                    await done.wait()
-
-                    await asyncio.sleep(0.05)
-
-                except Exception as e:
-                    print("TTS ERROR:", repr(e))
-
-                finally:
-                    try:
-                        if os.path.exists(filename):
-                            os.remove(filename)
-
-                    except Exception as e:
-                        print("파일 삭제 실패:", repr(e))
-
-        finally:
-            tts_playing[guild_id] = False
-
-            if guild_id in tts_queues and not tts_queues[guild_id].empty():
-                tts_playing[guild_id] = True
-                asyncio.create_task(play_tts_queue(bot, guild, lock))
+    finally:
+        if tts_workers.get(guild_id) is asyncio.current_task():
+            del tts_workers[guild_id]

@@ -3,6 +3,30 @@
 # =========================
 import re
 
+MAX_TTS_LENGTH = 50
+
+# 이 위치 뒤에 공백이 있을 때만 단어 단위로 자름
+MIN_WORD_CUT = 20
+
+
+# 웃음/울음은 2번만 반복돼도 표현으로 인정
+_LAUGH_RE = re.compile(r"([ㅋㅎㅠㅜ])\1+")
+
+# 감탄/리액션은 3번 이상부터 표현으로 인정
+_REACTION_RE = re.compile(r"([ㄷㅉ])\1{2,}")
+
+
+def _shrink_run(match: re.Match) -> str:
+    chars = match.group(0)
+    length = len(chars)
+
+    if length <= 5:
+        return chars
+
+    # 5개까지는 그대로 두고, 넘치는 만큼은 절반만 남기되 최대 10개
+    return chars[0] * min(5 + (length - 5) // 2, 10)
+
+
 def reduce_laughter(text: str) -> str:
     """
     너무 긴 웃음/울음/리액션 표현을 적당히 줄임.
@@ -10,27 +34,8 @@ def reduce_laughter(text: str) -> str:
     ㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋ -> ㅋㅋㅋㅋㅋㅋ
     ㅠㅠㅠㅠㅠㅠㅠㅠㅠㅠ -> ㅠㅠㅠㅠㅠ
     """
-    def replacer(match):
-        chars = match.group(0)
-        length = len(chars)
-
-        if length <= 5:
-            return chars
-
-        # 너무 긴 감정 표현은 절반 정도만 남김
-        new_length = 5 + int((length-5) * 0.5)
-
-        # 최소 5개, 최대 10개 정도로 제한
-        new_length = max(5, min(new_length, 10))
-
-        return chars[0] * new_length
-
-    text = re.sub(r"ㅋ{2,}", replacer, text)
-    text = re.sub(r"ㅎ{2,}", replacer, text)
-    text = re.sub(r"ㅠ{2,}", replacer, text)
-    text = re.sub(r"ㅜ{2,}", replacer, text)
-    text = re.sub(r"ㄷ{3,}", replacer, text)
-    text = re.sub(r"ㅉ{3,}", replacer, text)
+    text = _LAUGH_RE.sub(_shrink_run, text)
+    text = _REACTION_RE.sub(_shrink_run, text)
 
     return text
 
@@ -48,7 +53,15 @@ _KB_INDEX = {
     for c, ch in enumerate(row)
 }
 
-_EN2KR_KEYS = set("rRseEfaqQtTdwWczxvgkoiOjpuPhynbml")
+# 2벌식에서 자음/모음이 배치된 키
+_KO_CONSONANT_KEYS = "qwertasdfgzxcvQWERT"
+_KO_VOWEL_KEYS = "yuiophjklbnmOP"
+
+# 2벌식으로 한글을 치면 (초성)(중성)(종성?)이 반복되는 모양이 됨.
+# 영어 단어는 대부분 이 구조로 떨어지지 않음.
+_HANGUL_KEY_RE = re.compile(
+    f"(?:[{_KO_CONSONANT_KEYS}][{_KO_VOWEL_KEYS}]{{1,2}}[{_KO_CONSONANT_KEYS}]{{0,2}})+"
+)
 
 _COMMON_EN = {
     "the", "you", "and", "lol", "lmao", "ok", "okay", "bro", "wtf", "gg",
@@ -56,27 +69,28 @@ _COMMON_EN = {
     "what", "why", "how", "when", "who", "this", "that", "really", "nice",
 }
 
+_JAMO_RUN_RE = re.compile(r"[ㄱ-ㅎㅏ-ㅣ]+")
+_EN_TOKEN_RE = re.compile(r"[A-Za-z]{5,}")
+_WS_RE = re.compile(r"\s+")
 
-def _keyboard_adjacency_ratio(text: str) -> float:
+
+def _keyboard_stats(text: str) -> tuple[int, float]:
     """
-    자모가 키보드상 옆으로 연속해서 눌린 비율을 계산.
+    자모 개수와, 자모가 키보드상 옆으로 연속해서 눌린 비율을 한 번에 계산.
     예: ㅁㄴㅇㄹ 같은 건 인접 입력이 많아서 난타 가능성이 높음.
     """
-    jamo = [c for c in text if c in _KB_INDEX]
+    jamo = [_KB_INDEX[c] for c in text if c in _KB_INDEX]
 
     if len(jamo) < 4:
-        return 0.0
+        return len(jamo), 0.0
 
-    adj = 0
+    adj = sum(
+        1
+        for (ra, ca), (rb, cb) in zip(jamo, jamo[1:])
+        if ra == rb and abs(ca - cb) == 1
+    )
 
-    for a, b in zip(jamo, jamo[1:]):
-        ra, ca = _KB_INDEX[a]
-        rb, cb = _KB_INDEX[b]
-
-        if ra == rb and abs(ca - cb) == 1:
-            adj += 1
-
-    return adj / (len(jamo) - 1)
+    return len(jamo), adj / (len(jamo) - 1)
 
 
 def _unique_ratio(text: str) -> float:
@@ -95,45 +109,49 @@ def _looks_like_wrong_ime(text: str) -> bool:
     영어 상태에서 한글을 치려다 난타처럼 된 경우를 일부 감지.
     예: rkskekfk, dkssud 같은 입력.
     """
-    tokens = re.findall(r"[A-Za-z]{5,}", text)
-
-    if not tokens:
-        return False
-
-    for tok in tokens:
+    for tok in _EN_TOKEN_RE.findall(text):
         lower_tok = tok.lower()
 
         if lower_tok in _COMMON_EN:
             continue
 
-        if all(ch in _EN2KR_KEYS for ch in tok):
-            vowel_ratio = sum(ch.lower() in "aeiou" for ch in tok) / len(tok)
+        # 2벌식 음절 구조로 떨어지지 않으면 그냥 영어로 봄
+        if not _HANGUL_KEY_RE.fullmatch(tok):
+            continue
 
-            if vowel_ratio < 0.2:
-                return True
+        vowel_ratio = sum(ch in "aeiou" for ch in lower_tok) / len(tok)
+
+        if vowel_ratio < 0.2:
+            return True
 
     return False
 
+
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"  # 국기
+    "\U0001F300-\U0001F5FF"  # 기호 & 그림
+    "\U0001F600-\U0001F64F"  # 얼굴 이모지
+    "\U0001F680-\U0001F6FF"  # 교통/지도
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\U00002700-\U000027BF"
+    "\U00002600-\U000026FF"
+    "\U0000200D"             # ZWJ
+    "\U0000FE0F"             # variation selector
+    "]+",
+    flags=re.UNICODE
+)
+
+
 def remove_unicode_emojis(text: str) -> str:
-    emoji_pattern = re.compile(
-        "["
-        "\U0001F1E6-\U0001F1FF"  # 국기
-        "\U0001F300-\U0001F5FF"  # 기호 & 그림
-        "\U0001F600-\U0001F64F"  # 얼굴 이모지
-        "\U0001F680-\U0001F6FF"  # 교통/지도
-        "\U0001F700-\U0001F77F"
-        "\U0001F780-\U0001F7FF"
-        "\U0001F800-\U0001F8FF"
-        "\U0001F900-\U0001F9FF"
-        "\U0001FA00-\U0001FAFF"
-        "\U00002700-\U000027BF"
-        "\U00002600-\U000026FF"
-        "\U0000200D"             # ZWJ
-        "\U0000FE0F"             # variation selector
-        "]+",
-        flags=re.UNICODE
-    )
-    return emoji_pattern.sub(" ", text)
+    return _EMOJI_RE.sub(" ", text)
+
+
+_EMOTION_MIX_RE = re.compile(r"[ㅋㅎㅠㅜ]+")
 
 
 def _is_emotion_jamo_run(run: str) -> bool:
@@ -162,7 +180,7 @@ def _is_emotion_jamo_run(run: str) -> bool:
 
     # 섞인 감정 표현도 허용
     # 예: ㅋㅋㅎㅎ, ㅠㅜㅠㅜ, ㅋㅋㅠㅠ
-    if re.fullmatch(r"[ㅋㅎㅠㅜ]+", run):
+    if _EMOTION_MIX_RE.fullmatch(run):
         return True
 
     return False
@@ -178,19 +196,22 @@ def is_gibberish_korean(text: str) -> bool:
     if len(text) < 6:
         return False
 
-    compact = re.sub(r"\s+", "", text)
+    compact = _WS_RE.sub("", text)
 
     if not compact:
         return False
 
     # 자모 연속 검사
     # 단, 정상 감정 표현은 허용
-    jamo_runs = re.findall(r"[ㄱ-ㅎㅏ-ㅣ]+", compact)
+    jamo_runs = _JAMO_RUN_RE.findall(compact)
     suspicious_jamo_len = 0
+    only_emotion = bool(jamo_runs)
 
     for run in jamo_runs:
         if _is_emotion_jamo_run(run):
             continue
+
+        only_emotion = False
 
         # 예: ㅁㄴㅇㄹ, ㅏㅣㅓㅏ, ㅂㅈㄷㄱ 같은 난타
         if len(run) >= 4:
@@ -202,22 +223,16 @@ def is_gibberish_korean(text: str) -> bool:
     if suspicious_jamo_len >= 6:
         return True
 
-    jamo_count = sum(1 for c in compact if c in _KB_INDEX)
+    jamo_count, adjacency = _keyboard_stats(compact)
 
     # 키보드상 인접한 자모가 많이 이어지면 난타 가능성
     # 단, 전체 자모 run이 전부 감정 표현이면 허용
-    if jamo_count >= 4 and _keyboard_adjacency_ratio(compact) >= 0.6:
-        if jamo_runs and all(_is_emotion_jamo_run(run) for run in jamo_runs):
-            return False
-
+    if jamo_count >= 4 and adjacency >= 0.6 and not only_emotion:
         return True
 
     # 같은 문자 반복이 너무 많으면 난타/도배 가능성
     # 단, 감정 표현은 reduce_laughter()가 이미 줄였으므로 과하게 막지 않음
-    if len(compact) >= 12 and _unique_ratio(compact) < 0.3:
-        if jamo_runs and all(_is_emotion_jamo_run(run) for run in jamo_runs):
-            return False
-
+    if len(compact) >= 12 and _unique_ratio(compact) < 0.3 and not only_emotion:
         return True
 
     # 영어 상태에서 한글을 잘못 친 경우
@@ -225,6 +240,16 @@ def is_gibberish_korean(text: str) -> bool:
         return True
 
     return False
+
+
+_CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+_URL_RE = re.compile(r"https?://\S+")
+_MENTION_RE = re.compile(r"<@!?\d+>")
+_CHANNEL_RE = re.compile(r"<#\d+>")
+_ROLE_RE = re.compile(r"<@&\d+>")
+_SEMICOLON_RE = re.compile(r";{2,}")
+_EXCLAIM_RE = re.compile(r"!{3,}")
+_SYMBOL_RE = re.compile(r"[~@#$%^&*_=+`|\\/<>{}\[\]]+")
 
 
 def clean_tts_text(text: str) -> str:
@@ -243,56 +268,56 @@ def clean_tts_text(text: str) -> str:
 
         if not text:
             return ""
-    
+
     if text == "?":
         text = "왓"
 
     # ㅋㅋㅋㅋ, ㅎㅎㅎㅎ, ㅠㅠㅠㅠ 같은 표현은 먼저 축약
     text = reduce_laughter(text)
 
-    # 한글 난타 차단
-    if not force and is_gibberish_korean(text):
-        return ""
     # 커스텀 이모티콘 제거
-    text = re.sub(r"<a?:\w+:\d+>", " ", text)
+    text = _CUSTOM_EMOJI_RE.sub(" ", text)
 
     # 유니코드 이모지 제거
     text = remove_unicode_emojis(text)
 
     # URL 제거
-    text = re.sub(r"https?://\S+", " 링크 ", text)
+    text = _URL_RE.sub(" 링크 ", text)
 
     # 멘션 단순화
-    text = re.sub(r"<@!?\d+>", " 멘션 ", text)
-    text = re.sub(r"<#\d+>", " 채널 ", text)
-    text = re.sub(r"<@&\d+>", " 역할 ", text)
-    
+    text = _MENTION_RE.sub(" 멘션 ", text)
+    text = _CHANNEL_RE.sub(" 채널 ", text)
+    text = _ROLE_RE.sub(" 역할 ", text)
+
     # ; 살리기
-    text = re.sub(
-    r";{2,}",
-    lambda m: " " + " ".join(["쎄미콜론"] * min(len(m.group(0)), 3)) + " ",
-    text
+    text = _SEMICOLON_RE.sub(
+        lambda m: " " + " ".join(["쎄미콜론"] * min(len(m.group(0)), 3)) + " ",
+        text
     )
 
-    # 특수문자 과도 반복 제거
-    # 느낌표는 살려둠. 예: 와!!! 같은 표현
-    text = re.sub(r"[~@#$%^&*_=+`|\\/<>{}\[\]]+", " ", text)
+    # 느낌표는 살리되 과한 반복만 줄임. 예: 와!!!!!!!! -> 와!!
+    text = _EXCLAIM_RE.sub("!!", text)
+
+    # 읽을 수 없는 특수문자 제거
+    text = _SYMBOL_RE.sub(" ", text)
 
     # 공백 정리
-    text = re.sub(r"\s+", " ", text).strip()
+    text = _WS_RE.sub(" ", text).strip()
 
     if not text:
         return ""
 
-    # 길이 제한
-    max_length = 50
+    # 마크업을 다 걷어낸 뒤에 판정해야 이모티콘/링크/멘션이 난타 판정에 끼어들지 않음
+    if not force and is_gibberish_korean(text):
+        return ""
 
-    if len(text) > max_length:
-        cut = text[:max_length]
+    # 길이 제한
+    if len(text) > MAX_TTS_LENGTH:
+        cut = text[:MAX_TTS_LENGTH]
         last_space = cut.rfind(" ")
 
         # 영어/공백 있는 문장은 단어 중간에서 자르지 않도록 보정
-        if last_space >= 20:
+        if last_space >= MIN_WORD_CUT:
             cut = cut[:last_space]
 
         text = cut

@@ -1,7 +1,8 @@
 import discord
 from discord import app_commands
 import random
-from tts_voice import USER_TTS_SETTINGS, save_user_tts_settings
+from tts_queue import clear_guild_queue
+from tts_settings import USER_TTS_SETTINGS, save_user_tts_settings
 
 from champion_recommend import (
     pick_random_champion,
@@ -28,7 +29,7 @@ EMOJI_BOMB_POOL = [
 EMOJI_BOMB_COUNT = 10
 
 
-def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
+def setup_commands(bot, tts_channels, save_tts_channels):
 
     @bot.tree.command(
         name="ping",
@@ -156,12 +157,7 @@ def setup_commands(bot, tts_channels, save_tts_channels, tts_queues):
     )
     @app_commands.guild_only()
     async def clearqueue(interaction: discord.Interaction):
-        queue = tts_queues.get(interaction.guild.id)
-        cleared = 0
-
-        while queue is not None and not queue.empty():
-            queue.get_nowait()
-            cleared += 1
+        cleared = clear_guild_queue(interaction.guild.id)
 
         await interaction.response.send_message(
             f"큐 {cleared}개 비움",

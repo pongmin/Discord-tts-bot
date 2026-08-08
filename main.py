@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from http_session import close_session
-from tts_voice import add_tts_queue, add_bot_tts_queue, tts_queues
+from tts_queue import add_tts_queue, add_bot_tts_queue
 from discord_commands import setup_commands
 
 
@@ -156,7 +156,7 @@ class StoryBot(commands.Bot):
 
 bot = StoryBot(command_prefix="#", intents=intents)
 
-setup_commands(bot, tts_channels, save_tts_channels, tts_queues)
+setup_commands(bot, tts_channels, save_tts_channels)
 
 # =========================
 # 자동 반응

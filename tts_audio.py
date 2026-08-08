@@ -7,7 +7,10 @@ import urllib.parse
 
 from gtts import gTTS
 
+import gtts_session
 from http_session import get_session
+
+gtts_session.install()
 
 
 async def make_tts_audio(text: str, engine: str = "gtts", voice: str = "Kim") -> bytes:

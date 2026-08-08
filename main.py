@@ -8,6 +8,7 @@ import random
 import time
 from pathlib import Path
 
+from gtts_session import close_gtts_session
 from http_session import close_session
 from tts_queue import add_tts_queue, add_bot_tts_queue
 from discord_commands import setup_commands
@@ -151,6 +152,7 @@ intents.voice_states = True
 class StoryBot(commands.Bot):
     async def close(self):
         await close_session()
+        await close_gtts_session()
         await super().close()
 
 

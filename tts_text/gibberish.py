@@ -30,6 +30,9 @@ _MIXABLE_EMOTION_JAMO = set("ㅋㅎㅠㅜ")
 # ㄱㄱㄱㄱ(가자/go), ㄹㄹㄹㄹ, ㅁㅁㅁㅁ, ㅍㅍㅍㅍ, ㅂㅂㅂㅂ(bye), ㅅㅅㅅㅅ(고마워)도 흔한 채팅 표현이라 허용
 _REPEAT_ONLY_EMOTION_JAMO = set("ㄷㅉㅇㄴㄱㄹㅁㅍㅂㅅ")
 
+# 반복도 아니고 섞어도 안 되지만, 그 자체로 흔한 채팅 표현이라 통째로 허용
+_ALLOWED_JAMO_RUNS = {"ㅈㅉㅇㅇ"}
+
 
 def _looks_like_wrong_ime(text: str) -> bool:
     """
@@ -61,6 +64,9 @@ def _is_emotion_jamo_run(run: str) -> bool:
     """
     if not run:
         return False
+
+    if run in _ALLOWED_JAMO_RUNS:
+        return True
 
     chars = set(run)
 

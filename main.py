@@ -12,6 +12,7 @@ from gtts_session import close_gtts_session
 from http_session import close_session
 from tts_queue import add_tts_queue, add_bot_tts_queue
 from discord_commands import setup_commands
+from clash_commands import setup_clash_commands
 
 
 # =========================
@@ -84,8 +85,17 @@ KEYWORD_REACTIONS = [
         "keyword": "좆풍",
         "responses": ["씹풍", "좆풍", "개풍"],
         "prob": 0.3
+    },
+    {
+        "keyword": "권동현",
+        "responses": ["일본 여행"],
+        "prob": 0.5
+    },
+    {
+        "keyword": "권xx",
+        "responses": ["일본 여행"],
+        "prob": 0.5
     }
-    
 ]
 
 reaction_last_used = {}
@@ -159,6 +169,7 @@ class StoryBot(commands.Bot):
 bot = StoryBot(command_prefix="#", intents=intents)
 
 setup_commands(bot, tts_channels, save_tts_channels)
+setup_clash_commands(bot)
 
 # =========================
 # 자동 반응

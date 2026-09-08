@@ -5,3 +5,4 @@ discord.log
 tts_channels.json
 user_tts_settings.json
 *.mp3
+data/

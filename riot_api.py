@@ -11,8 +11,18 @@ ACCOUNT_ROUTE = "asia"
 # 클래시는 플랫폼(국가별 서버) 라우팅 값을 씀
 CLASH_ROUTE = "kr"
 
+# Match-V5도 ACCOUNT-V1과 같은 대륙 라우팅(지역) 값을 씀
+MATCH_ROUTE = "asia"
+
 ACCOUNT_BASE_URL = f"https://{ACCOUNT_ROUTE}.api.riotgames.com/riot/account/v1"
 CLASH_BASE_URL = f"https://{CLASH_ROUTE}.api.riotgames.com/lol/clash/v1"
+MATCH_BASE_URL = f"https://{MATCH_ROUTE}.api.riotgames.com/lol/match/v5"
+
+# 큐 ID: 솔로/듀오 랭크만 수집 대상. 자유랭크(440)는 수집하지 않음
+RANKED_SOLO_QUEUE_ID = 420
+
+# Match-V5의 by-puuid/ids 엔드포인트가 한 번에 허용하는 최대 count
+MATCH_IDS_PAGE_SIZE = 100
 
 
 class RiotApiError(Exception):
@@ -31,18 +41,26 @@ class NotInClashError(RiotApiError):
     pass
 
 
+class MatchNotFoundError(RiotApiError):
+    pass
+
+
 class InvalidApiKeyError(RiotApiError):
     pass
 
 
 class RateLimitedError(RiotApiError):
+    status_code = 429
+
     def __init__(self, retry_after: int | None = None):
         self.retry_after = retry_after
         super().__init__("Riot API 요청 한도를 초과했습니다.")
 
 
 class RiotServerError(RiotApiError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None):
+        self.status_code = status_code
+        super().__init__(message)
 
 
 @dataclass
@@ -103,7 +121,10 @@ async def _request_json(url: str):
             raise RateLimitedError(int(retry_after) if retry_after else None)
 
         if response.status >= 500:
-            raise RiotServerError(f"Riot API 서버 오류가 발생했습니다. (HTTP {response.status})")
+            raise RiotServerError(
+                f"Riot API 서버 오류가 발생했습니다. (HTTP {response.status})",
+                status_code=response.status
+            )
 
         raise RiotApiError(f"Riot API 요청이 실패했습니다. (HTTP {response.status})")
 
@@ -157,3 +178,54 @@ async def get_clash_team(team_id: str) -> list[ClashPlayer]:
         )
         for player in data["players"]
     ]
+
+
+# =========================
+# Match-V5 (솔로 랭크 전용)
+# =========================
+
+async def get_solo_queue_match_ids(puuid: str, count: int = 200) -> list[str]:
+    """
+    최신 순으로 최대 count개의 솔로 랭크(큐 420) 매치 ID를 가져옴.
+    Riot API가 by-puuid/ids 한 번 호출당 허용하는 count 상한이 있어서
+    MATCH_IDS_PAGE_SIZE 단위로 나눠서 요청함.
+    """
+    match_ids: list[str] = []
+    start = 0
+
+    while len(match_ids) < count:
+        remaining = count - len(match_ids)
+        page_size = min(MATCH_IDS_PAGE_SIZE, remaining)
+
+        url = (
+            f"{MATCH_BASE_URL}/matches/by-puuid/{puuid}/ids"
+            f"?start={start}&count={page_size}&queue={RANKED_SOLO_QUEUE_ID}"
+        )
+        page = await _request_json(url)
+
+        if not page:
+            break
+
+        match_ids.extend(page)
+
+        # 요청한 것보다 적게 왔다는 건 그 플레이어의 기록이 거기서 끝났다는 뜻
+        if len(page) < page_size:
+            break
+
+        start += page_size
+
+    return match_ids
+
+
+async def get_match_by_id(match_id: str) -> dict:
+    """
+    Match-V5 상세 응답을 가공 없이 그대로 반환함.
+    필드를 버리지 않고 그대로 저장해야 나중에 다시 계산할 수 있기 때문.
+    """
+    url = f"{MATCH_BASE_URL}/matches/{match_id}"
+    data = await _request_json(url)
+
+    if data is None:
+        raise MatchNotFoundError(f"매치를 찾을 수 없습니다: {match_id}")
+
+    return data

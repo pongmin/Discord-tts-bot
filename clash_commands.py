@@ -40,7 +40,7 @@ def setup_clash_commands(bot):
 
     @bot.tree.command(
         name="clashlookup",
-        description="Riot ID로 현재 참가 중인 클래시 팀을 조회합니다."
+        description="Riot ID로 현재 참가 중인 격전 팀을 조회합니다."
     )
     @app_commands.describe(riot_id="예: Hide on bush#KR1")
     async def clashlookup(interaction: discord.Interaction, riot_id: str):
@@ -83,7 +83,7 @@ def setup_clash_commands(bot):
                 lines.append(f"{player.position:<9}{name}{marker}")
 
             embed = discord.Embed(
-                title="클래시 팀",
+                title="격전 팀",
                 description="```\n" + "\n".join(lines) + "\n```",
                 color=0x5865F2
             )

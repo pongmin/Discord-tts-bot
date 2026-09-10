@@ -1,10 +1,18 @@
-"""Observed-pool ban recommendations, v1.1. No API calls or parameter tuning.
+"""Observed-pool ban recommendations, v1.2. No API calls or parameter tuning.
 
 Pick probabilities use dated, queue-weighted observations. Threat uses raw
 role-filtered wins/games and a weak, shrunk KDA signal. Meta rates use all other
 same-role participants across patches. Off-support meta mass is retained in a
 separate, unbannable Others bucket with neutral threat, not a champion ID.
 Pool exhaustion means reliance on this prior, never zero player strength.
+
+Threat and Dependency are kept deliberately separate. Threat asks "how well do
+they do on this champion" (performance); Dependency asks "how much of their
+familiar pool do they lose if this champion is banned" (pick-share loss),
+using the pre-meta-blend P_personal, not P_final - a low personal reliance
+that gets inflated by meta backoff would otherwise be double-counted as
+dependency it doesn't represent. A player's final residual is the performance
+residual times the dependency penalty: r(p,B) = r_perf(p,B) * D(p,B).
 """
 
 from collections import Counter, defaultdict
@@ -26,7 +34,14 @@ ALPHA = 0.4
 KDA_EPSILON = 1e-6
 OTHERS_EPSILON = 1e-6
 T_OTHERS = 1.0
+ETA = 0.35
 TOP_CANDIDATES = 8
+# Per player, always keep this many of their own top-P_personal champions as
+# ban candidates, in addition to the TOP_CANDIDATES chosen by performance
+# (P_final * threat). Without this, a heavily-relied-on but low-threat main
+# (exactly what Dependency exists to penalize) could be pruned out before the
+# search ever runs, making the new term moot for the champion it targets.
+DEPENDENCY_CANDIDATES = 3
 BAN_COUNT = 3
 DAY_MS = 24 * 60 * 60 * 1000
 QUEUE_WEIGHTS = {420: 1.0, 400: GAMMA}
@@ -78,19 +93,43 @@ class PlayerModel:
             *((c.p_final / mass) * c.threat for c in remaining),
         ])
 
+    def dependency_mass(self, bans: Collection[int] = frozenset()) -> float:
+        """q(p,B): personal (pre-meta-blend) pick share banned away, restricted
+        to champions this player has actually played - Others is a
+        performance prior, never part of anyone's pool, so it never
+        contributes here regardless of how large bans gets.
+        """
+        q = math.fsum(c.p_personal for cid, c in self.champions.items() if cid in bans)
+        # P_personal already sums to <= 1 over the observed pool, so this is
+        # just float-safety, not a real clamp on realistic inputs.
+        return min(1.0, max(0.0, q))
+
+    def dependency(self, bans: Collection[int] = frozenset()) -> float:
+        """D(p,B) = exp(-ETA * q(p,B)); 1.0 (no penalty) when B bans nothing
+        the player has observed themselves picking.
+        """
+        return math.exp(-ETA * self.dependency_mass(bans))
+
     def residual_ratio(self, bans: Collection[int] = frozenset()) -> float:
-        return self.strength(bans) / self.strength()
+        """r(p,B) = r_perf(p,B) * D(p,B); both factors are 1 for B=empty."""
+        return (self.strength(bans) / self.strength()) * self.dependency(bans)
 
     def observed_pool_exhausted(self, bans: Collection[int] = frozenset()) -> bool:
         """True means strength relies entirely on the unseen-champion prior."""
         return math.fsum(c.p_final for cid, c in self.champions.items() if cid not in bans) <= 0
 
     def candidate_champions(self) -> tuple[int, ...]:
-        ordered = sorted(
+        by_score = sorted(
             self.champions.values(),
             key=lambda c: (-c.candidate_score, c.champion_id),
         )
-        return tuple(c.champion_id for c in ordered[:TOP_CANDIDATES])
+        by_personal = sorted(
+            self.champions.values(),
+            key=lambda c: (-c.p_personal, c.champion_id),
+        )
+        selected = {c.champion_id for c in by_score[:TOP_CANDIDATES]}
+        selected.update(c.champion_id for c in by_personal[:DEPENDENCY_CANDIDATES])
+        return tuple(sorted(selected))
 
 
 @dataclass(frozen=True)
@@ -301,7 +340,13 @@ def recommend_bans(repo: ScoutingRepo, opponents: Sequence[tuple[int, str]]) -> 
     baselines = tuple(p.strength() for p in players)
 
     def residuals_for(bans: Collection[int]) -> tuple[float, ...]:
-        return tuple(p.strength(bans) / baseline for p, baseline in zip(players, baselines))
+        # r(p,B) = r_perf(p,B) * D(p,B). baselines caches S(p,empty) so the
+        # performance half isn't recomputed per combination; dependency is
+        # cheap (a sum over at most BAN_COUNT champion lookups) either way.
+        return tuple(
+            (p.strength(bans) / baseline) * p.dependency(bans)
+            for p, baseline in zip(players, baselines)
+        )
 
     def exhausted_for(bans: Collection[int]) -> tuple[int, ...]:
         return tuple(p.player_id for p in players if p.observed_pool_exhausted(bans))

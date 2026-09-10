@@ -300,7 +300,13 @@ def _reason(result: Recommendation, impact: BanImpact) -> str:
         return f"{len(players)}개 포지션에 동시에 영향{shared}"
     models = [player.champions[impact.champion_id] for player in players]
     # These thresholds choose explanatory words only; no new score or ordering.
-    if any(champion.p_final >= 0.5 for champion in models):
+    # Dependency framing uses p_personal (the pre-meta-blend pick share that
+    # actually drives the algorithm's Dependency penalty), not p_final, which
+    # meta backoff can inflate or deflate away from what the player themselves
+    # actually relies on.
+    if any(champion.p_personal >= 0.7 for champion in models):
+        return "압도적인 모스트 픽"
+    if any(champion.p_personal >= 0.5 for champion in models):
         return "주력 픽 의존도가 높음"
     if any(champion.p_final >= 0.2 and champion.threat >= 1.10 for champion in models):
         return "높은 픽 비중과 위험도"

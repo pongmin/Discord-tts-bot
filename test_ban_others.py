@@ -63,7 +63,10 @@ class OthersTests(unittest.TestCase):
         self.assertTrue(model.observed_pool_exhausted(bans))
         self.assertFalse(model.observed_pool_exhausted({1, 2}))
         self.assertEqual(model.strength(bans), 1)
-        self.assertEqual(model.residual_ratio(bans), 1 / model.strength())
+        # residual_ratio now folds in the Dependency penalty (r = r_perf * D);
+        # exhausting the pool bans 100% of this player's personal mass, so D
+        # here is exp(-ETA), not 1.
+        self.assertAlmostEqual(model.residual_ratio(bans), (1 / model.strength()) * model.dependency(bans))
         for aggregate in (geometric_mean, harmonic_mean):
             value = aggregate((model.residual_ratio(bans), 1, 1, 1, 1), (0.2,) * 5)
             self.assertGreater(value, 0)
@@ -85,7 +88,12 @@ class OthersTests(unittest.TestCase):
         first = replace(first, champions={cid: replace(c, threat=2) for cid, c in first.champions.items()})
         players = [first]
         for pid, role in enumerate(("JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"), 2):
-            champion = ChampionModel(10 + pid, f"Champion{10 + pid}", 1, 1, 1, 0, .9, .5, 1)
+            # p_personal=0: these filler players aren't the subject under
+            # test, so they must stay Dependency-neutral (D=1 regardless of
+            # bans) - otherwise the new Dependency term makes banning their
+            # single, 100%-personal-reliance champion look artificially
+            # attractive to the search, which isn't what this test is about.
+            champion = ChampionModel(10 + pid, f"Champion{10 + pid}", 1, 1, 0, 0, .9, .5, 1)
             players.append(PlayerModel(pid, f"Player{pid}#TEST", role, {champion.champion_id: champion}, .5, 1, p_others=.1))
         with patch("ban_algorithm.build_player_model", side_effect=players):
             result = recommend_bans(Mock(), [(p.player_id, p.role) for p in players])

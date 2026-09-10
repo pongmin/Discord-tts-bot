@@ -8,8 +8,9 @@ from http_session import get_session
 # Riot ID -> PUUID 조회는 지역 라우팅(대륙) 값을 씀
 ACCOUNT_ROUTE = "asia"
 
-# 클래시는 플랫폼(국가별 서버) 라우팅 값을 씀
-CLASH_ROUTE = "kr"
+# 플랫폼(국가별 서버) 라우팅 값. 클래시/챔피언 숙련도/리그 API가 공통으로 씀.
+PLATFORM_ROUTE = "kr"
+CLASH_ROUTE = PLATFORM_ROUTE
 
 # Match-V5도 ACCOUNT-V1과 같은 대륙 라우팅(지역) 값을 씀
 MATCH_ROUTE = "asia"
@@ -17,6 +18,12 @@ MATCH_ROUTE = "asia"
 ACCOUNT_BASE_URL = f"https://{ACCOUNT_ROUTE}.api.riotgames.com/riot/account/v1"
 CLASH_BASE_URL = f"https://{CLASH_ROUTE}.api.riotgames.com/lol/clash/v1"
 MATCH_BASE_URL = f"https://{MATCH_ROUTE}.api.riotgames.com/lol/match/v5"
+MASTERY_BASE_URL = f"https://{PLATFORM_ROUTE}.api.riotgames.com/lol/champion-mastery/v4"
+LEAGUE_BASE_URL = f"https://{PLATFORM_ROUTE}.api.riotgames.com/lol/league/v4"
+
+# League-V4 entries/by-puuid가 반환하는 queueType 문자열 (큐 ID와는 별개 네임스페이스).
+RANKED_SOLO_QUEUE_TYPE = "RANKED_SOLO_5x5"
+RANKED_FLEX_QUEUE_TYPE = "RANKED_FLEX_SR"
 
 # 큐 ID (공식 목록: https://static.developer.riotgames.com/docs/lol/queues.json)
 #
@@ -30,6 +37,14 @@ NORMAL_QUICKPLAY_QUEUE_ID = 490
 # 랭크 자유. 스카우팅 수집 대상에서 명시적으로 제외함(ALLOWED_SCOUTING_QUEUE_IDS에 없음).
 RANKED_FLEX_QUEUE_ID = 440
 
+# 소환사의 협곡 클래시. Riot 공식 큐 목록(https://static.developer.riotgames.com/docs/lol/queues.json)에서
+# "Summoner's Rift Clash games" 항목을 직접 확인한 값 = 700 (ARAM 클래시는 별도 720이며 대상 아님).
+# 클래시는 실제 대회 드래프트에서 뭘 고르는지에 대한 그라운드 트루스라서 수집은 하되,
+# feature/training 쪽 풀 계산(예: analyze_thickness.py의 --queues)에는 기본적으로 섞이지 않게
+# ALLOWED_SCOUTING_QUEUE_IDS에는 넣어서 collect_matches.py로 수집은 가능하게 하고,
+# analyze_thickness.py 쪽에서 --queues 인자로는 별도로 거부함(RANKED_FLEX_QUEUE_ID와 같은 방식).
+CLASH_QUEUE_ID = 700
+
 # collect_matches.py --queues / analyze_thickness.py --queues 가 허용하는 큐 목록.
 # 아레나(1700)나 이벤트성 큐(URF 등)가 실수로/API 오동작으로 섞여 들어오는 걸
 # 막기 위한 allow-list 역할도 함 - 여기 없는 큐 ID는 애초에 요청하지 않음.
@@ -37,6 +52,7 @@ ALLOWED_SCOUTING_QUEUE_IDS: dict[int, str] = {
     RANKED_SOLO_QUEUE_ID: "RANKED_SOLO",
     NORMAL_DRAFT_QUEUE_ID: "NORMAL_DRAFT",
     NORMAL_QUICKPLAY_QUEUE_ID: "NORMAL_QUICKPLAY",
+    CLASH_QUEUE_ID: "CLASH",
 }
 
 # Match-V5의 by-puuid/ids 엔드포인트가 한 번에 허용하는 최대 count.
@@ -95,6 +111,24 @@ class ClashPlayer:
     puuid: str
     position: str
     role: str = "MEMBER"
+
+
+@dataclass
+class ChampionMastery:
+    champion_id: int
+    mastery_points: int
+    mastery_level: int
+    last_play_time: int | None
+
+
+@dataclass
+class LeagueEntry:
+    queue_type: str
+    tier: str
+    division: str
+    lp: int
+    wins: int
+    losses: int
 
 
 def _get_api_key() -> str:
@@ -249,3 +283,52 @@ async def get_match_by_id(match_id: str) -> dict:
         raise MatchNotFoundError(f"매치를 찾을 수 없습니다: {match_id}")
 
     return data
+
+
+# =========================
+# Champion-Mastery-V4 / League-V4 (스냅샷 수집용)
+# =========================
+
+async def get_champion_masteries(puuid: str) -> list[ChampionMastery]:
+    """
+    해당 puuid의 전체 챔피언 숙련도를 반환함. 기록이 하나도 없으면 빈 리스트.
+    """
+    url = f"{MASTERY_BASE_URL}/champion-masteries/by-puuid/{puuid}"
+    data = await _request_json(url)
+
+    if not data:
+        return []
+
+    return [
+        ChampionMastery(
+            champion_id=entry["championId"],
+            mastery_points=entry["championPoints"],
+            mastery_level=entry["championLevel"],
+            last_play_time=entry.get("lastPlayTime"),
+        )
+        for entry in data
+    ]
+
+
+async def get_league_entries(puuid: str) -> list[LeagueEntry]:
+    """
+    해당 puuid의 전체 리그 항목(솔로랭크/자유랭크 등)을 반환함.
+    언랭이면 항목이 없어서 빈 리스트가 올 수 있음.
+    """
+    url = f"{LEAGUE_BASE_URL}/entries/by-puuid/{puuid}"
+    data = await _request_json(url)
+
+    if not data:
+        return []
+
+    return [
+        LeagueEntry(
+            queue_type=entry["queueType"],
+            tier=entry["tier"],
+            division=entry["rank"],
+            lp=entry["leaguePoints"],
+            wins=entry["wins"],
+            losses=entry["losses"],
+        )
+        for entry in data
+    ]

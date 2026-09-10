@@ -13,6 +13,7 @@ cutoff_time=None이면 컷오프 없이 최신까지 전부 조회함(백테스�
 import sqlite3
 
 import scouting_db as db
+from riot_api import CLASH_QUEUE_ID
 
 
 class ScoutingRepo:
@@ -113,8 +114,73 @@ class ScoutingRepo:
         params = (player_id, *queue_params, *cutoff_params)
         return self._conn.execute(query, params).fetchall()
 
+    def get_other_participant_role_matches(
+        self,
+        player_id: int,
+        role: str,
+        queue_ids: tuple[int, ...] | list[int] = (420, 400),
+    ) -> list[sqlite3.Row]:
+        """Return other players' role observations from this player's matches.
+
+        The player's own role does not restrict the match set. This v1 local
+        meta sample pools all patches, while respecting queue_ids and the
+        repository's game_end cutoff. Each participant/match appears once.
+        """
+        cutoff_clause, cutoff_params = self._cutoff_clause("m")
+        queue_clause, queue_params = self._queue_in_clause(queue_ids)
+
+        query = f"""
+            SELECT
+                pm.player_id, pm.match_id, pm.champion_id, pm.champion_name,
+                pm.canonical_role, pm.win,
+                m.game_start, m.game_end, m.game_version, m.patch, m.queue_id
+            FROM player_matches pm
+            JOIN matches m ON m.match_id = pm.match_id
+            WHERE pm.player_id != ?
+              AND pm.canonical_role = ?
+              AND {queue_clause}
+              AND EXISTS (
+                  SELECT 1
+                  FROM player_matches own
+                  WHERE own.player_id = ? AND own.match_id = pm.match_id
+              )
+              {cutoff_clause}
+            ORDER BY m.game_start ASC, pm.match_id ASC, pm.player_id ASC
+        """
+
+        params = (player_id, role, *queue_params, player_id, *cutoff_params)
+        return self._conn.execute(query, params).fetchall()
+
     def get_fetch_state(self, player_id: int, queue_id: int = 420) -> sqlite3.Row | None:
         return db.get_fetch_state(self._conn, player_id, queue_id)
+
+    def get_clash_matches(self, player_id: int) -> list[sqlite3.Row]:
+        """
+        이 선수의 Clash 경기만(큐 700 고정) 반환함. Clash는 검증용 그라운드
+        트루스이지 feature/training 풀에 섞이면 안 되므로, get_all_matches에
+        큐 ID를 매번 직접 넘기지 않도록 별도의 명시적인 진입점으로 분리해 둠.
+        """
+        return self.get_all_matches(player_id, queue_ids=(CLASH_QUEUE_ID,))
+
+    def get_latest_mastery_snapshot(self, player_id: int, champion_id: int) -> sqlite3.Row | None:
+        """
+        cutoff_time 이전(포함)에서 가장 최근 숙련도 스냅샷 하나. cutoff_time보다
+        나중 스냅샷은 절대 반환하지 않음.
+        """
+        return db.get_latest_mastery_snapshot(self._conn, player_id, champion_id, self.cutoff_time)
+
+    def get_latest_mastery_snapshots(self, player_id: int) -> list[sqlite3.Row]:
+        """
+        챔피언별로 cutoff_time 이전(포함)에서 가장 최근 스냅샷 하나씩.
+        """
+        return db.get_latest_mastery_snapshots(self._conn, player_id, self.cutoff_time)
+
+    def get_latest_rank_snapshot(self, player_id: int, queue_type: str) -> sqlite3.Row | None:
+        """
+        cutoff_time 이전(포함)에서 가장 최근 랭크 스냅샷 하나. cutoff_time보다
+        나중 스냅샷은 절대 반환하지 않음.
+        """
+        return db.get_latest_rank_snapshot(self._conn, player_id, queue_type, self.cutoff_time)
 
     def close(self) -> None:
         if self._owns_conn:

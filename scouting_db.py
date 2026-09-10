@@ -103,6 +103,32 @@ CREATE TABLE IF NOT EXISTS fetch_failures (
 );
 
 CREATE INDEX IF NOT EXISTS idx_fetch_failures_match ON fetch_failures(match_id);
+
+-- mastery_snapshots / rank_snapshots: append-only. 기존 행을 절대 UPDATE하지
+-- 않고, 수집할 때마다 새 snapshot_at으로 새 행을 INSERT함(시계열로 축적).
+CREATE TABLE IF NOT EXISTS mastery_snapshots (
+    player_id INTEGER NOT NULL,
+    champion_id INTEGER NOT NULL,
+    mastery_points INTEGER NOT NULL,
+    mastery_level INTEGER NOT NULL,
+    last_play_time INTEGER,
+    snapshot_at INTEGER NOT NULL,
+    PRIMARY KEY (player_id, champion_id, snapshot_at),
+    FOREIGN KEY (player_id) REFERENCES players(id)
+);
+
+CREATE TABLE IF NOT EXISTS rank_snapshots (
+    player_id INTEGER NOT NULL,
+    queue_type TEXT NOT NULL,
+    tier TEXT,
+    division TEXT,
+    lp INTEGER,
+    wins INTEGER,
+    losses INTEGER,
+    snapshot_at INTEGER NOT NULL,
+    PRIMARY KEY (player_id, queue_type, snapshot_at),
+    FOREIGN KEY (player_id) REFERENCES players(id)
+);
 """
 
 
@@ -402,6 +428,138 @@ def get_fetch_state(conn: sqlite3.Connection, player_id: int, queue_id: int) -> 
 # =========================
 # fetch_failures
 # =========================
+
+# =========================
+# mastery_snapshots / rank_snapshots (append-only)
+# =========================
+
+def insert_mastery_snapshot(
+    conn: sqlite3.Connection,
+    player_id: int,
+    champion_id: int,
+    mastery_points: int,
+    mastery_level: int,
+    last_play_time: int | None,
+    snapshot_at: int,
+) -> None:
+    """
+    항상 새 행을 INSERT함. 기존 스냅샷을 덮어쓰지 않음
+    (같은 player_id/champion_id/snapshot_at 조합이 이미 있으면 PK 위반으로 실패함 -
+    같은 수집 배치 안에서는 champion_id가 서로 달라서 충돌하지 않음).
+    """
+    conn.execute(
+        """
+        INSERT INTO mastery_snapshots (
+            player_id, champion_id, mastery_points, mastery_level, last_play_time, snapshot_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (player_id, champion_id, mastery_points, mastery_level, last_play_time, snapshot_at)
+    )
+
+
+def insert_rank_snapshot(
+    conn: sqlite3.Connection,
+    player_id: int,
+    queue_type: str,
+    tier: str | None,
+    division: str | None,
+    lp: int | None,
+    wins: int | None,
+    losses: int | None,
+    snapshot_at: int,
+) -> None:
+    """
+    항상 새 행을 INSERT함. 기존 스냅샷을 덮어쓰지 않음.
+    """
+    conn.execute(
+        """
+        INSERT INTO rank_snapshots (
+            player_id, queue_type, tier, division, lp, wins, losses, snapshot_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (player_id, queue_type, tier, division, lp, wins, losses, snapshot_at)
+    )
+
+
+def get_latest_mastery_snapshot(
+    conn: sqlite3.Connection,
+    player_id: int,
+    champion_id: int,
+    cutoff_time: int | None = None,
+) -> sqlite3.Row | None:
+    """
+    cutoff_time이 주어지면 snapshot_at <= cutoff_time인 것 중 가장 최근 스냅샷을 반환함.
+    cutoff_time이 None이면 전체에서 가장 최근 스냅샷을 반환함.
+    """
+    query = "SELECT * FROM mastery_snapshots WHERE player_id = ? AND champion_id = ?"
+    params: tuple = (player_id, champion_id)
+
+    if cutoff_time is not None:
+        query += " AND snapshot_at <= ?"
+        params += (cutoff_time,)
+
+    query += " ORDER BY snapshot_at DESC LIMIT 1"
+
+    return conn.execute(query, params).fetchone()
+
+
+def get_latest_mastery_snapshots(
+    conn: sqlite3.Connection,
+    player_id: int,
+    cutoff_time: int | None = None,
+) -> list[sqlite3.Row]:
+    """
+    챔피언별로 cutoff_time 이전(또는 전체)에서 가장 최근 스냅샷 하나씩만 반환함.
+    """
+    query = """
+        SELECT ms.*
+        FROM mastery_snapshots ms
+        JOIN (
+            SELECT champion_id, MAX(snapshot_at) AS max_snapshot_at
+            FROM mastery_snapshots
+            WHERE player_id = ?
+    """
+    params: tuple = (player_id,)
+
+    if cutoff_time is not None:
+        query += " AND snapshot_at <= ?"
+        params += (cutoff_time,)
+
+    query += """
+            GROUP BY champion_id
+        ) latest
+        ON latest.champion_id = ms.champion_id AND latest.max_snapshot_at = ms.snapshot_at
+        WHERE ms.player_id = ?
+        ORDER BY ms.champion_id
+    """
+    params += (player_id,)
+
+    return conn.execute(query, params).fetchall()
+
+
+def get_latest_rank_snapshot(
+    conn: sqlite3.Connection,
+    player_id: int,
+    queue_type: str,
+    cutoff_time: int | None = None,
+) -> sqlite3.Row | None:
+    """
+    cutoff_time이 주어지면 snapshot_at <= cutoff_time인 것 중 가장 최근 스냅샷을 반환함.
+    cutoff_time이 None이면 전체에서 가장 최근 스냅샷을 반환함.
+    """
+    query = "SELECT * FROM rank_snapshots WHERE player_id = ? AND queue_type = ?"
+    params: tuple = (player_id, queue_type)
+
+    if cutoff_time is not None:
+        query += " AND snapshot_at <= ?"
+        params += (cutoff_time,)
+
+    query += " ORDER BY snapshot_at DESC LIMIT 1"
+
+    return conn.execute(query, params).fetchone()
+
 
 def record_failure(
     conn: sqlite3.Connection,

@@ -13,6 +13,7 @@ from http_session import close_session
 from tts_queue import add_tts_queue, add_bot_tts_queue
 from discord_commands import setup_commands
 from clash_commands import setup_clash_commands
+from ban_commands import setup_ban_commands
 
 
 # =========================
@@ -170,6 +171,7 @@ bot = StoryBot(command_prefix="#", intents=intents)
 
 setup_commands(bot, tts_channels, save_tts_channels)
 setup_clash_commands(bot)
+setup_ban_commands(bot)
 
 # =========================
 # 자동 반응

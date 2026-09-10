@@ -19,6 +19,10 @@ NOVEL_PICK_WINDOWS = (20, 50, 100, 200)
 
 THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000
 
+# 이보다 Clash 표본이 적으면 coverage 비율을 신뢰 가능한 지표로 취급하지 않고
+# 경고와 함께 보여줌 (표본이 1~2개인데 100%/0%가 나오는 걸 그대로 믿으면 안 됨).
+CLASH_SMALL_SAMPLE_THRESHOLD = 5
+
 
 def _percentile(sorted_values: list[float], pct: float) -> float:
     """
@@ -168,6 +172,77 @@ def compute_player_thickness(
         "earliest_match_ms": earliest_match_ms,
         "latest_match_ms": latest_match_ms,
         "span_days": span_days,
+    }
+
+
+def compute_clash_coverage(
+    repo: ScoutingRepo,
+    player_id: int,
+    ranked_queue_ids: tuple[int, ...],
+    ranked_plus_normals_queue_ids: tuple[int, ...],
+) -> dict:
+    """
+    이 선수가 뛴 Clash 경기마다, 그 경기에서 고른 챔피언이 "그 경기 시점 이전"의
+    챔피언 풀(같은 role) 안에 있었는지를 봄. 검증(ground-truth) 목적이며 모델/가중치는
+    여기서 다루지 않음.
+
+    각 Clash 경기의 풀은 반드시 그 경기의 game_end를 cutoff_time으로 한
+    ScoutingRepo(cutoff_time=...)로 새로 계산함 - 선수의 챔피언 선호는 몇 달 사이에도
+    크게 바뀌므로, 지금 시점의 전체 이력으로 계산한 풀과 비교하면 측정 자체가
+    무의미해짐(3월 클래시 픽을 9월 풀과 비교하는 격). repo와 connection을 공유해서
+    쓰므로 경기마다 새 sqlite connection을 열지는 않음.
+
+    game_end가 없는(아주 오래된/불완전한) 경기는 cutoff를 걸 수 없어서
+    안전하게 건너뛰고 excluded_missing_game_end에 집계함.
+    """
+    clash_rows = repo.get_clash_matches(player_id)
+
+    per_game = []
+    excluded_missing_game_end = 0
+    ranked_hits = 0
+    normals_hits = 0
+
+    for row in clash_rows:
+        if row["game_end"] is None:
+            excluded_missing_game_end += 1
+            continue
+
+        role = row["canonical_role"]
+        cutoff_repo = ScoutingRepo(cutoff_time=row["game_end"], conn=repo._conn)
+
+        ranked_rows = cutoff_repo.get_role_matches(player_id, role, queue_ids=ranked_queue_ids)
+        normals_rows = cutoff_repo.get_role_matches(player_id, role, queue_ids=ranked_plus_normals_queue_ids)
+
+        ranked_pool = {r["champion_name"] for r in ranked_rows}
+        normals_pool = {r["champion_name"] for r in normals_rows}
+
+        in_ranked = row["champion_name"] in ranked_pool
+        in_normals = row["champion_name"] in normals_pool
+
+        ranked_hits += int(in_ranked)
+        normals_hits += int(in_normals)
+
+        per_game.append({
+            "match_id": row["match_id"],
+            "game_end_ms": row["game_end"],
+            "role": role,
+            "champion_name": row["champion_name"],
+            "in_ranked_pool": in_ranked,
+            "in_normals_pool": in_normals,
+            "ranked_pool_size": len(ranked_pool),
+            "normals_pool_size": len(normals_pool),
+        })
+
+    n = len(per_game)
+
+    return {
+        "total_clash_games_found": len(clash_rows),
+        "excluded_missing_game_end": excluded_missing_game_end,
+        "clash_game_count": n,
+        "is_small_sample": n < CLASH_SMALL_SAMPLE_THRESHOLD,
+        "ranked_coverage_rate": (ranked_hits / n) if n else None,
+        "normals_coverage_rate": (normals_hits / n) if n else None,
+        "games": per_game,
     }
 
 

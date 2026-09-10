@@ -16,6 +16,7 @@ import ban_commands as command
 from clash_commands import setup_clash_commands
 from riot_api import RiotAccount, PlayerNotFoundError
 import scouting_db as db
+from scouting_job_manager import ScoutingJobManager
 
 
 class BanCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -31,10 +32,14 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.ranks = AsyncMock(return_value=[])
         self.collect = AsyncMock(side_effect=self.collect_success)
         self.games_per_fetch = None
+        # A fresh manager per test: the real one is a process-wide singleton,
+        # and dedupe state (same team = same key) must not bleed across tests.
+        self.jobs = ScoutingJobManager()
         self.patches = [
             patch.object(command, "get_account_by_riot_id", self.accounts),
             patch.object(command, "get_league_entries", self.ranks),
             patch.object(command, "collect_player_matches", self.collect),
+            patch.object(command, "scouting_jobs", self.jobs),
         ]
         for mock_patch in self.patches:
             mock_patch.start()
@@ -48,6 +53,9 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
     def connection(self):
         conn = sqlite3.connect(self.uri, uri=True)
         conn.row_factory = sqlite3.Row
+        # Mirror scouting_db.get_connection()'s busy_timeout: concurrent-team
+        # tests open multiple connections against the same shared in-memory DB.
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     async def collect_success(self, puuid, name, tag, *, queue_id, max_count, conn):
@@ -93,15 +101,15 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bad_format_and_duplicate_input_before_api(self):
         for raw in ("missingtag", "#tag", "name#", "name#tag#extra"):
-            with self.subTest(raw=raw), self.assertRaisesRegex(command.BanCommandError, "bottom.*입력 오류"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(command.BanCommandError, "BOTTOM.*입력 오류"):
                 await command.prepare_opponents(self.inputs | {"bottom": raw}, self.progress)
         self.accounts.assert_not_awaited()
-        with self.assertRaisesRegex(command.BanCommandError, "중복.*top, bottom"):
+        with self.assertRaisesRegex(command.BanCommandError, "중복.*TOP, BOTTOM"):
             await command.prepare_opponents(self.inputs | {"bottom": " player0#test "}, self.progress)
 
     async def test_duplicate_puuid_before_collection(self):
         self.accounts.side_effect = lambda name, tag: RiotAccount("same", name, tag)
-        with self.assertRaisesRegex(command.BanCommandError, "중복.*top, jungle"):
+        with self.assertRaisesRegex(command.BanCommandError, "중복.*TOP, JUNGLE"):
             await command.prepare_opponents(self.inputs, self.progress)
         self.collect.assert_not_awaited()
 
@@ -114,14 +122,14 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(flags=flags):
                 self.collect.side_effect = None
                 self.collect.return_value = dict(player_id=1, **flags)
-                with self.assertRaisesRegex(command.BanCommandError, "top 수집 실패.*Player0#TEST.*420"):
+                with self.assertRaisesRegex(command.BanCommandError, "TOP 수집 실패.*Player0#TEST.*솔로 랭크"):
                     await command.prepare_opponents(self.inputs, self.progress)
                 self.ranks.assert_not_awaited()
 
     async def test_missing_role_data_is_explicit(self):
         self.collect.side_effect = None
         self.collect.return_value = dict(player_id=1, failed=0, aborted=False, is_complete=True)
-        with self.assertRaisesRegex(command.BanCommandError, "top 데이터 부족.*Player0#TEST"):
+        with self.assertRaisesRegex(command.BanCommandError, "TOP 데이터 부족.*Player0#TEST"):
             await command.prepare_opponents(self.inputs, self.progress)
 
     async def test_cancelled_refresh_cannot_become_fresh_cache(self):
@@ -141,47 +149,149 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["is_complete"])
         self.assertGreater(state["last_attempt_at"], 0)
 
-    async def test_command_registration_lookup_failure_and_timeout(self):
+    def _bot_with_ban_commands(self):
         bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
         self.addAsyncCleanup(bot.close)
         setup_clash_commands(bot)
         clash = bot.tree.get_command("clashlookup")
         command.setup_ban_commands(bot)
         self.assertIs(bot.tree.get_command("clashlookup"), clash)
-        slash = bot.tree.get_command("banrecommend")
+        return bot.tree.get_command("banrecommend")
+
+    @staticmethod
+    def _interaction(user_id: int = 123, guild_id: int = 555):
+        channel = SimpleNamespace(id=999, send=AsyncMock())
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=user_id), guild_id=guild_id, channel=channel,
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+        return interaction, channel
+
+    async def test_command_registration_shape(self):
+        slash = self._bot_with_ban_commands()
         self.assertEqual([p.name for p in slash.parameters], list(command.ROLE_INPUTS) + ["depth"])
         self.assertTrue(all(p.required for p in slash.parameters[:5]))
         depth_param = slash.parameters[-1]
         self.assertFalse(depth_param.required)
         self.assertEqual(depth_param.default, "normal")
         self.assertEqual([c.value for c in depth_param.choices], ["quick", "normal", "deep"])
-        interaction = SimpleNamespace(
-            response=SimpleNamespace(defer=AsyncMock()),
-            edit_original_response=AsyncMock(), followup=SimpleNamespace(send=AsyncMock()),
-        )
-        self.accounts.side_effect = PlayerNotFoundError("계정 없음")
+
+    async def test_bad_input_replies_immediately_without_starting_a_job(self):
+        slash = self._bot_with_ban_commands()
+        interaction, channel = self._interaction()
+        await slash.callback(interaction, **(self.inputs | {"bottom": "badformat"}))
+        interaction.response.send_message.assert_awaited_once()
+        call = interaction.response.send_message.call_args
+        self.assertIn("입력 오류", call.args[0])
+        self.assertTrue(call.kwargs.get("ephemeral"))
+        self.accounts.assert_not_awaited()
+        await asyncio.sleep(0)
+        channel.send.assert_not_awaited()
+
+    async def test_command_returns_immediately_then_job_delivers_result_to_channel(self):
+        slash = self._bot_with_ban_commands()
+        interaction, channel = self._interaction()
+
         await slash.callback(interaction, **self.inputs)
-        self.assertIn("top 계정 조회 (Player0#TEST)", interaction.edit_original_response.call_args.kwargs["content"])
-        self.assertIn("계정 없음", interaction.edit_original_response.call_args.kwargs["content"])
+
+        # The command itself must not block on collection: it acknowledges
+        # right away, and nothing has been sent to the channel yet.
+        interaction.response.send_message.assert_awaited_once()
+        ack = interaction.response.send_message.call_args
+        self.assertIn("분석을 시작했습니다", ack.args[0])
+        self.assertFalse(ack.kwargs.get("ephemeral", False))
+        channel.send.assert_not_awaited()
+        self.accounts.assert_not_awaited()  # background job hasn't run a tick yet
+
+        key = command._team_key(command.parse_inputs(self.inputs))
+        job = self.jobs.get(key)
+        self.assertIsNotNone(job)
+        await job.task  # let the background job run to completion
+
+        self.assertEqual(job.status.value, "completed")
+        self.assertEqual(self.collect.await_count, 10)
+        channel.send.assert_awaited_once()
+        sent = channel.send.call_args.kwargs
+        view = sent["view"]
+        self.addCleanup(view.stop)
+        self.assertEqual(view.page_index, 0)
+        self.assertIn("TOP", sent["embed"].title)
+        self.assertEqual(view.message, channel.send.return_value)
+
+    async def test_failure_is_reported_to_the_channel_with_the_failing_player_and_stage(self):
+        slash = self._bot_with_ban_commands()
+        interaction, channel = self._interaction()
+        self.accounts.side_effect = PlayerNotFoundError("계정 없음")
+
+        await slash.callback(interaction, **self.inputs)
+        key = command._team_key(command.parse_inputs(self.inputs))
+        job = self.jobs.get(key)
+        await job.task  # ScoutingJobManager swallows the exception into job.error
+
+        self.assertEqual(job.status.value, "failed")
+        self.assertIn("계정 없음", job.error)
         self.collect.assert_not_awaited()
-        initial = interaction.edit_original_response.call_args_list[0].kwargs["content"]
-        self.assertIn("depth=normal", initial)
-        self.assertIn("100 games/queue per player", initial)
-        self.assertIn("min/player", initial)
+        channel.send.assert_awaited_once()
+        message = channel.send.call_args.args[0]
+        self.assertIn("TOP 계정 조회 (Player0#TEST)", message)
+        self.assertIn("계정 없음", message)
 
-        async def slow(*args):
-            await asyncio.sleep(60)
+    async def test_duplicate_team_job_is_rejected_but_different_teams_are_not(self):
+        slash = self._bot_with_ban_commands()
+        interaction1, channel = self._interaction(user_id=1)
+        interaction2, _ = self._interaction(user_id=2)
+        interaction2.channel = channel
 
-        with patch.object(command, "prepare_opponents", side_effect=slow), patch.object(command, "COMMAND_TIMEOUT_SECONDS", 0.001):
-            await slash.callback(interaction, **self.inputs)
-        self.assertIn("처리 시간이 초과", interaction.edit_original_response.call_args.kwargs["content"])
-        # The lock was released on failure; a successful run still sends ALL text.
-        report = "Recommendation\n" * 200 + "observed_pool_exhausted=True\nWARNING: sensitivity"
-        with patch.object(command, "prepare_opponents", return_value=[]), patch.object(command, "_recommend_report", return_value=report):
-            await slash.callback(interaction, **self.inputs)
-        output = [interaction.edit_original_response.call_args.kwargs["content"]]
-        output.extend(call.args[0] for call in interaction.followup.send.call_args_list)
-        self.assertEqual("".join(chunk[4:-4] for chunk in output), report)
+        gate = asyncio.Event()
+
+        async def blocked(*args, **kwargs):
+            await gate.wait()
+            return await self.collect_success(*args, **kwargs)
+
+        self.collect.side_effect = blocked
+
+        await slash.callback(interaction1, **self.inputs)
+        await asyncio.sleep(0)  # let the background job start and reach the gate
+
+        # Same team (even from a different user) while the first is still running.
+        await slash.callback(interaction2, **self.inputs)
+        interaction2.response.send_message.assert_awaited_once_with(
+            "이미 같은 팀을 분석 중입니다.", ephemeral=True
+        )
+
+        # A different team must not be blocked by the first team's in-flight job.
+        other_inputs = self.inputs | {"top": "Different0#TEST"}
+        interaction3, _ = self._interaction(user_id=3)
+        interaction3.channel = channel
+        await slash.callback(interaction3, **other_inputs)
+        interaction3.response.send_message.assert_awaited_once()
+        self.assertIn("분석을 시작했습니다", interaction3.response.send_message.call_args.args[0])
+
+        gate.set()
+        key1 = command._team_key(command.parse_inputs(self.inputs))
+        key3 = command._team_key(command.parse_inputs(other_inputs))
+        await self.jobs.get(key1).task
+        await self.jobs.get(key3).task
+        self.assertEqual(self.jobs.get(key1).status.value, "completed")
+        self.assertEqual(self.jobs.get(key3).status.value, "completed")
+
+    async def test_job_reuses_existing_cache_on_a_second_run(self):
+        slash = self._bot_with_ban_commands()
+        interaction, channel = self._interaction()
+
+        await slash.callback(interaction, **self.inputs)
+        key = command._team_key(command.parse_inputs(self.inputs))
+        await self.jobs.get(key).task
+        self.assertEqual(self.collect.await_count, 10)
+
+        # Same team again, after the first job completed: cached matches are
+        # reused, so collection is not re-awaited.
+        self.collect.reset_mock()
+        self.accounts.reset_mock()
+        await slash.callback(interaction, **self.inputs)
+        await self.jobs.get(key).task
+        self.collect.assert_not_awaited()
+        self.assertEqual(channel.send.await_count, 2)
 
     async def test_depth_caps_upgrade_and_skip_independent_of_fetch_state(self):
         for depth, cap in (("quick", 30), ("normal", 100), ("deep", 200)):
@@ -241,16 +351,14 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.count("only 2 role-filtered games available"), 5)
 
     async def test_invalid_depth_does_not_start_lookup(self):
-        with self.assertRaisesRegex(command.BanCommandError, "depth"):
+        with self.assertRaisesRegex(command.BanCommandError, "수집 깊이"):
             await command.prepare_opponents(self.inputs, self.progress, "automatic")
         self.accounts.assert_not_awaited()
 
-    def test_chunk_limits_and_all_warnings_preserved(self):
-        report = "😀" * 2200 + "\n" + "a\n" * 1500 + "WARNING: sensitivity\nobserved_pool_exhausted=True"
-        chunks = command.report_chunks(report)
-        self.assertEqual("".join(chunk[4:-4] for chunk in chunks), report)
-        self.assertTrue(all(len(chunk.encode("utf-16-le")) // 2 <= 2000 for chunk in chunks))
-        self.assertTrue(all(chunk.count("```") == 2 for chunk in command.report_chunks("a```b")))
+    def test_algorithm_errors_are_displayed_in_korean(self):
+        message = command._error_text(ValueError("At least 3 distinct candidate champions are required for a 3-ban search."))
+        self.assertIn("3종 미만", message)
+        self.assertNotIn("candidate", message)
 
 
 if __name__ == "__main__":

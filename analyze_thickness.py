@@ -20,11 +20,26 @@ import json
 from datetime import datetime, timezone
 
 from match_position import VALID_POSITIONS
-from riot_api import RANKED_SOLO_QUEUE_ID, RANKED_FLEX_QUEUE_ID, ALLOWED_SCOUTING_QUEUE_IDS
+from riot_api import (
+    RANKED_SOLO_QUEUE_ID,
+    RANKED_FLEX_QUEUE_ID,
+    CLASH_QUEUE_ID,
+    ALLOWED_SCOUTING_QUEUE_IDS,
+)
 from scouting_repo import ScoutingRepo
-from scouting_analysis import compute_player_thickness, summarize_group
+from scouting_analysis import (
+    compute_player_thickness,
+    summarize_group,
+    compute_clash_coverage,
+    CLASH_SMALL_SAMPLE_THRESHOLD,
+)
 
 RANKED_ONLY_QUEUES = (RANKED_SOLO_QUEUE_ID,)
+
+# --clash-coverage의 "ranked+normals" 풀은 항상 랭크 자유/클래시를 제외한
+# ALLOWED_SCOUTING_QUEUE_IDS 전체로 계산함. 새 일반 큐가 나중에 추가돼도
+# 여기서 자동으로 따라가고, 클래시는 항상 제외됨.
+RANKED_PLUS_NORMALS_QUEUES = tuple(q for q in ALLOWED_SCOUTING_QUEUE_IDS if q != CLASH_QUEUE_ID)
 
 
 def _parse_queues(value: str) -> tuple[int, ...]:
@@ -40,6 +55,13 @@ def _parse_queues(value: str) -> tuple[int, ...]:
 
         if queue_id == RANKED_FLEX_QUEUE_ID:
             raise ValueError("랭크 자유(440)는 분석 대상에서 제외됨")
+
+        if queue_id == CLASH_QUEUE_ID:
+            raise ValueError(
+                "클래시(700)는 --queues로 풀 계산에 섞을 수 없음 - "
+                "검증용 그라운드 트루스라서 feature/training 풀과 분리해야 함. "
+                "--clash-coverage를 대신 쓸 것"
+            )
 
         if queue_id not in ALLOWED_SCOUTING_QUEUE_IDS:
             allowed = ", ".join(str(q) for q in ALLOWED_SCOUTING_QUEUE_IDS)
@@ -136,6 +158,48 @@ def _format_novel_pick_comparison(ranked_only: dict, ranked_plus_normals: dict, 
     return "\n".join(lines)
 
 
+def _fmt_date_ms(ms: int | None) -> str:
+    if ms is None:
+        return "N/A"
+
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _format_clash_coverage(result: dict) -> str:
+    n = result["clash_game_count"]
+    lines = [
+        f"  Clash games found: {result['total_clash_games_found']} "
+        f"(사용 n={n}, game_end 없어서 제외={result['excluded_missing_game_end']})"
+    ]
+
+    if n == 0:
+        lines.append("  Clash 경기가 없어서 coverage를 계산할 수 없음")
+        return "\n".join(lines)
+
+    if result["is_small_sample"]:
+        lines.append(
+            f"  ⚠ 표본이 작음(n={n} < {CLASH_SMALL_SAMPLE_THRESHOLD}) - 아래 비율은 참고용일 뿐, "
+            f"신뢰 가능한 지표로 취급하면 안 됨"
+        )
+
+    lines.append(f"  ranked-only coverage    : {_fmt_pct(result['ranked_coverage_rate'])} (n={n})")
+    lines.append(f"  ranked+normals coverage : {_fmt_pct(result['normals_coverage_rate'])} (n={n})")
+    lines.append("  게임별 상세:")
+
+    for game in result["games"]:
+        date = _fmt_date_ms(game["game_end_ms"])
+        ranked_mark = "YES" if game["in_ranked_pool"] else "no"
+        normals_mark = "YES" if game["in_normals_pool"] else "no"
+
+        lines.append(
+            f"    {date}  {game['role']:<8} {game['champion_name']:<16} "
+            f"ranked-pool(n={game['ranked_pool_size']:>3})={ranked_mark:<3}  "
+            f"normals-pool(n={game['normals_pool_size']:>3})={normals_mark}"
+        )
+
+    return "\n".join(lines)
+
+
 def _format_stats(label: str, stats: dict) -> str:
     if stats["n"] == 0:
         return f"  {label}: N/A (표본 없음)"
@@ -143,22 +207,77 @@ def _format_stats(label: str, stats: dict) -> str:
     return f"  {label}: median={stats['median']:.3g}, p25={stats['p25']:.3g}, p75={stats['p75']:.3g} (n={stats['n']})"
 
 
+def _run_clash_coverage(args: argparse.Namespace) -> None:
+    """
+    선수별로 Clash 경기 전체(모든 role 섞임 - role은 경기마다 개별로 씀)를 훑어서
+    각 경기 시점 기준 ranked-only / ranked+normals 풀 커버리지를 계산함.
+    """
+    cutoff_ms = _parse_cutoff(args.cutoff)
+    repo = ScoutingRepo(cutoff_time=cutoff_ms)
+
+    try:
+        results = []
+
+        for identifier in args.identifiers:
+            player_id = _resolve_player_id(repo, identifier)
+
+            if player_id is None:
+                print(f"DB에서 찾을 수 없음: {identifier} (먼저 collect_matches.py --queues 700으로 클래시를 수집해줘)")
+                continue
+
+            result = compute_clash_coverage(
+                repo, player_id, RANKED_ONLY_QUEUES, RANKED_PLUS_NORMALS_QUEUES
+            )
+            result["identifier"] = identifier
+            results.append(result)
+
+        if args.json:
+            print(json.dumps({"players": results}, ensure_ascii=False, indent=2))
+            return
+
+        for result in results:
+            print(f"=== {result['identifier']} Clash coverage ===")
+            print(_format_clash_coverage(result))
+            print()
+
+    finally:
+        repo.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="데이터 두께 / 노벨 픽 분석")
     parser.add_argument("identifiers", nargs="+", help="Riot ID(이름#태그) 또는 puuid, 여러 개 가능")
-    parser.add_argument("--role", required=True, choices=sorted(VALID_POSITIONS), help="분석할 포지션")
+    parser.add_argument(
+        "--role", default=None, choices=sorted(VALID_POSITIONS),
+        help="분석할 포지션 (--clash-coverage에서는 무시됨 - 경기별로 실제 뛴 role을 씀)"
+    )
     parser.add_argument(
         "--queues",
         default=str(RANKED_SOLO_QUEUE_ID),
         help=(
             f"쉼표로 구분한 큐 ID 목록 (기본 {RANKED_SOLO_QUEUE_ID}=솔로랭크만). "
-            f"허용값: {', '.join(f'{qid}={name}' for qid, name in ALLOWED_SCOUTING_QUEUE_IDS.items())}"
+            f"허용값: {', '.join(f'{qid}={name}' for qid, name in ALLOWED_SCOUTING_QUEUE_IDS.items())} "
+            f"(클래시는 여기 못 씀 - --clash-coverage 참고)"
         ),
     )
     parser.add_argument("--cutoff", default=None, help="ISO 날짜/시각. 이 시점 이후 매치는 제외함 (백테스트용)")
+    parser.add_argument(
+        "--clash-coverage", action="store_true",
+        help=(
+            "Clash에서 고른 챔피언이 그 경기 시점 이전의 ranked-only / ranked+normals "
+            "챔피언 풀 안에 있었는지 검증 리포트를 출력함 (모델링 아님, 측정만)"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="결과를 JSON으로 출력")
 
     args = parser.parse_args()
+
+    if args.clash_coverage:
+        _run_clash_coverage(args)
+        return
+
+    if args.role is None:
+        parser.error("--role은 --clash-coverage를 쓰지 않는 한 필수임")
 
     try:
         queue_ids = _parse_queues(args.queues)

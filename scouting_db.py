@@ -138,6 +138,12 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # Background scouting jobs for different teams can now write concurrently
+    # (each opens its own connection). Without this, a writer that finds the
+    # DB locked by another connection raises immediately; with it, sqlite
+    # retries internally for up to 5s before giving up. This does not change
+    # single-connection/single-thread usage anywhere else in the app.
+    conn.execute("PRAGMA busy_timeout = 5000")
 
     return conn
 

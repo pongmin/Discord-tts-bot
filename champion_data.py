@@ -44,6 +44,7 @@ class ChampionDataNotLoadedError(ChampionDataError):
 # 프로세스 내 인메모리 캐시. 디스크 캐시가 있어도 매 호출마다 다시 읽지 않기 위함.
 _id_to_name: dict[int, str] | None = None
 _name_to_id: dict[str, int] | None = None
+_id_to_image_key: dict[int, str] | None = None
 _loaded_version: str | None = None
 _loaded_locale: str | None = None
 
@@ -52,9 +53,10 @@ def _champion_file_path(version: str, locale: str) -> Path:
     return DATA_DIR / f"champion_{version}_{locale}.json"
 
 
-def _build_maps(champion_data: dict) -> tuple[dict[int, str], dict[str, int]]:
+def _build_maps(champion_data: dict) -> tuple[dict[int, str], dict[str, int], dict[int, str]]:
     id_to_name: dict[int, str] = {}
     name_to_id: dict[str, int] = {}
+    id_to_image_key: dict[int, str] = {}
 
     for entry in champion_data["data"].values():
         champion_id_value = int(entry["key"])
@@ -62,8 +64,12 @@ def _build_maps(champion_data: dict) -> tuple[dict[int, str], dict[str, int]]:
 
         id_to_name[champion_id_value] = name
         name_to_id[name] = champion_id_value
+        # entry["id"] is Data Dragon's own (always-English) sprite/image key,
+        # e.g. "MonkeyKing" - independent of the champion.json locale, so it's
+        # safe to read from whichever locale we happened to fetch.
+        id_to_image_key[champion_id_value] = entry["id"]
 
-    return id_to_name, name_to_id
+    return id_to_name, name_to_id, id_to_image_key
 
 
 def _load_meta() -> dict | None:
@@ -85,7 +91,7 @@ def _load_from_disk() -> bool:
     요청은 하지 않음). meta.json에 로케일이 없는 옛 캐시(로케일별 파일명을
     쓰기 전에 받아둔 것)는 더 이상 신뢰하지 않고 새로 받으라고 False를 반환함.
     """
-    global _id_to_name, _name_to_id, _loaded_version, _loaded_locale
+    global _id_to_name, _name_to_id, _id_to_image_key, _loaded_version, _loaded_locale
 
     meta = _load_meta()
 
@@ -104,7 +110,7 @@ def _load_from_disk() -> bool:
         return False
 
     champion_data = json.loads(champion_path.read_text(encoding="utf-8"))
-    _id_to_name, _name_to_id = _build_maps(champion_data)
+    _id_to_name, _name_to_id, _id_to_image_key = _build_maps(champion_data)
     _loaded_version = version
     _loaded_locale = locale
 
@@ -155,7 +161,7 @@ async def refresh_champion_data(force: bool = False, locale: str = DEFAULT_LOCAL
 
     반환값은 이번에 로드된(캐시로 쓰이게 된) 버전 문자열.
     """
-    global _id_to_name, _name_to_id, _loaded_version, _loaded_locale
+    global _id_to_name, _name_to_id, _id_to_image_key, _loaded_version, _loaded_locale
 
     latest_version = await _fetch_latest_version()
     champion_path = _champion_file_path(latest_version, locale)
@@ -168,7 +174,7 @@ async def refresh_champion_data(force: bool = False, locale: str = DEFAULT_LOCAL
         champion_data = json.loads(champion_path.read_text(encoding="utf-8"))
 
     _save_meta(latest_version, locale)
-    _id_to_name, _name_to_id = _build_maps(champion_data)
+    _id_to_name, _name_to_id, _id_to_image_key = _build_maps(champion_data)
     _loaded_version = latest_version
     _loaded_locale = locale
 
@@ -192,6 +198,22 @@ def champion_id(name: str) -> int | None:
     """
     _ensure_loaded()
     return _name_to_id.get(name)
+
+
+def champion_image_key(id: int) -> str | None:
+    """
+    챔피언 ID로 Data Dragon 스퀘어 아이콘 URL에 쓰는 (항상 영문) 이미지 키를
+    찾음(예: 266 -> "Aatrox"). 아이콘 URL은
+    f"https://ddragon.leagueoflegends.com/cdn/{version}/img/champion/{key}.png".
+    """
+    _ensure_loaded()
+    return _id_to_image_key.get(id)
+
+
+def known_champion_ids() -> list[int]:
+    """현재 캐시에 있는 챔피언 ID 전체(champion_emoji.py의 동기화 대상 목록으로 씀)."""
+    _ensure_loaded()
+    return list(_id_to_name)
 
 
 def current_version() -> str | None:

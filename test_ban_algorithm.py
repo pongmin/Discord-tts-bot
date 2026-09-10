@@ -1,4 +1,4 @@
-"""Manual v1 demo: real Pongmin#3369 plus four synthetic teammates.
+"""Manual v1.1 demo: real Pongmin#3369 plus four synthetic teammates.
 
 Run ``python test_ban_algorithm.py`` (optionally ``--db /path/to/scouting.db``).
 The collected database is opened read-only and copied into memory. All fixture
@@ -141,6 +141,7 @@ def main() -> int:
                 top = max(pongmin.champions.values(), key=lambda c: (c.p_final, -c.champion_id))
                 print(f"  Top champion: {top.name}")
                 print(f"  P_final(X): {top.p_final:.3f}")
+                print(f"  P_others: {pongmin.p_others:.6f}")
                 print(f"  T(X): {top.threat:.3f}")
                 print(f"  r(empty): {pongmin.residual_ratio():.3f}")
                 top_ban = frozenset({top.champion_id})
@@ -174,9 +175,9 @@ def main() -> int:
                 print(f"  S={synthetic.strength(entire_pool):.3f}, r={synthetic.residual_ratio(entire_pool):.3f}")
                 print(f"  observed_pool_exhausted={synthetic.observed_pool_exhausted(entire_pool)}")
                 print("  This flag records an exhausted observed pool; it does not establish actual zero ability.")
-                residuals, weights = (0, 1, 1, 1, 1), (0.2,) * 5
+                residuals, weights = (synthetic.residual_ratio(entire_pool), 1, 1, 1, 1), (0.2,) * 5
                 print(
-                    f"  Equal-weight team with r=(0, 1, 1, 1, 1): "
+                    f"  Equal-weight team with exhausted player relying on Others: "
                     f"V_1={arithmetic_mean(residuals, weights):.3f}, "
                     f"V_0={geometric_mean(residuals, weights):.3f}, "
                     f"V_-1={harmonic_mean(residuals, weights):.3f}"

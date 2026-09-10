@@ -1,3 +1,4 @@
+import asyncio
 import discord
 from discord.ext import commands
 import logging
@@ -9,6 +10,7 @@ import time
 from pathlib import Path
 
 import champion_data
+import champion_emoji
 from gtts_session import close_gtts_session
 from http_session import close_session
 from tts_queue import add_tts_queue, add_bot_tts_queue
@@ -234,6 +236,23 @@ async def on_ready():
 
         except Exception as e:
             print("챔피언 데이터 캐시 갱신 실패 (영문 이름으로 대체됨):", repr(e))
+
+    # 챔피언 아이콘 이모지 동기화(최초 실행 시 챔피언 수만큼 업로드해서 몇 분
+    # 걸릴 수 있음) - on_ready를 막지 않도록 백그라운드 task로 돌림. 이미
+    # 올라간 이모지는 다시 올리지 않으니 재시작마다는 순식간에 끝남. 위의
+    # 챔피언 데이터 캐시가 준비된 뒤에만 의미가 있어 그 다음에 시작함.
+    if not getattr(bot, "champion_emoji_sync_started", False):
+        bot.champion_emoji_sync_started = True
+
+        async def _sync_champion_emojis():
+            try:
+                summary = await champion_emoji.sync_champion_emojis(bot)
+                print(f"챔피언 이모지 동기화 완료: {summary}")
+
+            except Exception as e:
+                print("챔피언 이모지 동기화 실패 (아이콘 없이 표시됨):", repr(e))
+
+        asyncio.create_task(_sync_champion_emojis())
 
     if not getattr(bot, "synced", False):
         all_ok = True

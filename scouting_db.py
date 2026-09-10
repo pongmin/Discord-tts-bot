@@ -16,6 +16,7 @@
 읽기 전용 분석 쪽은 scouting_repo.ScoutingRepo를 통해서 함.
 """
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -128,6 +129,21 @@ CREATE TABLE IF NOT EXISTS rank_snapshots (
     snapshot_at INTEGER NOT NULL,
     PRIMARY KEY (player_id, queue_type, snapshot_at),
     FOREIGN KEY (player_id) REFERENCES players(id)
+);
+
+-- /banrecommend가 보낸 6페이지 리포트 메시지 하나당 한 행. 봇이 재시작돼도
+-- 이전/다음 버튼이 계속 동작하도록(persistent view), 그 메시지를 다시 만드는 데
+-- 필요한 최소 정보(대상 팀, 컷오프, 현재 페이지)만 저장함 - Recommendation
+-- 자체는 저장하지 않고 버튼을 누를 때 opponents+cutoff_time으로 다시 계산함.
+CREATE TABLE IF NOT EXISTS ban_reports (
+    message_id INTEGER PRIMARY KEY,
+    channel_id INTEGER NOT NULL,
+    guild_id INTEGER,
+    owner_id INTEGER NOT NULL,
+    cutoff_time INTEGER NOT NULL,
+    opponents_json TEXT NOT NULL,
+    page_index INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
 );
 """
 
@@ -583,3 +599,64 @@ def record_failure(
         (endpoint, match_id, status_code, now_ms(), int(retryable), message)
     )
     conn.commit()
+
+
+# =========================
+# ban_reports (persistent /banrecommend 리포트 view 복구용)
+# =========================
+
+def save_ban_report(
+    conn: sqlite3.Connection,
+    message_id: int,
+    channel_id: int,
+    guild_id: int | None,
+    owner_id: int,
+    cutoff_time: int,
+    opponents: list[tuple[int, str]],
+    page_index: int = 0,
+) -> None:
+    """
+    리포트 메시지 하나를 저장/갱신함(같은 message_id로 다시 부르면 덮어씀).
+    opponents는 recommend_bans()에 넘긴 그대로 [(player_id, role), ...]를
+    JSON으로 저장해서, 봇이 재시작돼도 같은 컷오프로 그대로 재계산할 수 있게 함.
+    """
+    conn.execute(
+        """
+        INSERT INTO ban_reports (
+            message_id, channel_id, guild_id, owner_id, cutoff_time,
+            opponents_json, page_index, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            channel_id = excluded.channel_id,
+            guild_id = excluded.guild_id,
+            owner_id = excluded.owner_id,
+            cutoff_time = excluded.cutoff_time,
+            opponents_json = excluded.opponents_json,
+            page_index = excluded.page_index
+        """,
+        (
+            message_id, channel_id, guild_id, owner_id, cutoff_time,
+            json.dumps(opponents), page_index, now_ms(),
+        )
+    )
+    conn.commit()
+
+
+def get_ban_report(conn: sqlite3.Connection, message_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM ban_reports WHERE message_id = ?", (message_id,)
+    ).fetchone()
+
+
+def update_ban_report_page(conn: sqlite3.Connection, message_id: int, page_index: int) -> None:
+    conn.execute(
+        "UPDATE ban_reports SET page_index = ? WHERE message_id = ?",
+        (page_index, message_id)
+    )
+    conn.commit()
+
+
+def ban_report_opponents(row: sqlite3.Row) -> list[tuple[int, str]]:
+    """opponents_json을 recommend_bans()가 받는 [(player_id, role), ...] 형태로 되돌림."""
+    return [(player_id, role) for player_id, role in json.loads(row["opponents_json"])]

@@ -1,13 +1,10 @@
-"""Observed-pool ban recommendations, v1. No API calls or parameter tuning.
+"""Observed-pool ban recommendations, v1.1. No API calls or parameter tuning.
 
 Pick probabilities use dated, queue-weighted observations. Threat uses raw
 role-filtered wins/games and a weak, shrunk KDA signal. Meta rates use all other
-same-role participants across patches; the 15% mixture is then normalized over
-the player's observed pool.
-
-No Others bucket exists: exhausting an observed pool gives S=0 and r=0 in v1.
-This optimistic convention can yield 100% team threat reduction for geometric
-and harmonic aggregation. It is exposed in diagnostics, not an unseen-pick model.
+same-role participants across patches. Off-support meta mass is retained in a
+separate, unbannable Others bucket with neutral threat, not a champion ID.
+Pool exhaustion means reliance on this prior, never zero player strength.
 """
 
 from collections import Counter, defaultdict
@@ -27,6 +24,8 @@ K = 8
 BETA = 4
 ALPHA = 0.4
 KDA_EPSILON = 1e-6
+OTHERS_EPSILON = 1e-6
+T_OTHERS = 1.0
 TOP_CANDIDATES = 8
 BAN_COUNT = 3
 DAY_MS = 24 * 60 * 60 * 1000
@@ -68,21 +67,22 @@ class PlayerModel:
     rank_score: float
     warnings: tuple[str, ...] = ()
     kda_baseline: float = 0.0
+    p_others: float = OTHERS_EPSILON
 
     def strength(self, bans: Collection[int] = frozenset()) -> float:
         remaining = [c for cid, c in self.champions.items() if cid not in bans]
-        mass = math.fsum(c.p_final for c in remaining)
-        if mass <= 0:
-            # Explicit v1 observed-only convention: no redistribution denominator
-            # remains. This can produce 100% team threat reduction at rho=0/-1.
-            return 0.0
+        mass = math.fsum([self.p_others, *(c.p_final for c in remaining)])
         # Sum remaining mass directly; 1 - banned_mass loses tiny rare picks.
-        return math.fsum((c.p_final / mass) * c.threat for c in remaining)
+        return math.fsum([
+            self.p_others / mass * T_OTHERS,
+            *((c.p_final / mass) * c.threat for c in remaining),
+        ])
 
     def residual_ratio(self, bans: Collection[int] = frozenset()) -> float:
         return self.strength(bans) / self.strength()
 
     def observed_pool_exhausted(self, bans: Collection[int] = frozenset()) -> bool:
+        """True means strength relies entirely on the unseen-champion prior."""
         return math.fsum(c.p_final for cid, c in self.champions.items() if cid not in bans) <= 0
 
     def candidate_champions(self) -> tuple[int, ...]:
@@ -199,16 +199,23 @@ def build_player_model(repo: ScoutingRepo, player_id: int, role: str) -> PlayerM
         player_id, role, queue_ids=tuple(QUEUE_WEIGHTS)
     )
     # Empirical (unweighted) rates use ALL other same-role picks as denominator.
-    # Only seen champions enter the mixture, which is normalized AFTER blending.
-    # Off-support meta mass is discarded, never turned into an Others bucket.
+    # Preserve off-support mass separately; Others is never a champion/candidate.
     meta_counts = Counter(row["champion_id"] for row in meta_rows if row["champion_id"] is not None)
     meta_total = sum(meta_counts.values())
     notes = []
     meta = {cid: meta_counts[cid] / meta_total if meta_total else 0.0 for cid in games}
-    if not any(meta.values()):
-        notes.append(f"{label}/{role}: no meta observations in the seen pool; using personal probabilities.")
+    if not meta_total:
+        notes.append(f"{label}/{role}: no meta observations; using personal probabilities with safety Others mass.")
     mixed = {cid: (1 - LAMBDA) * personal[cid] + LAMBDA * meta[cid] for cid in games}
-    mixed_total = math.fsum(mixed.values())
+    off_support = LAMBDA * max(0.0, 1.0 - math.fsum(meta.values())) if meta_total else 0.0
+    p_others = max(OTHERS_EPSILON, off_support)
+    # Epsilon is numerical/model safety, not an estimated unseen pick rate.
+    # The ordinary meta mixture already sums to one: leave seen P unchanged.
+    # Only the safety fallback (including absent meta) needs normalization.
+    if off_support < OTHERS_EPSILON:
+        mixed_total = math.fsum([p_others, *mixed.values()])
+        mixed = {cid: probability / mixed_total for cid, probability in mixed.items()}
+        p_others /= mixed_total
 
     # Date/queue weights apply only to picks; WR and KDA performance is raw.
     baseline = sum(wins.values()) / len(rows)
@@ -224,14 +231,14 @@ def build_player_model(repo: ScoutingRepo, player_id: int, role: str) -> PlayerM
         threat = math.exp(BETA * (wr_adj - baseline) + ALPHA * kda_log_ratio)
         champions[cid] = ChampionModel(
             cid, names[cid], games[cid], wins[cid], personal[cid], meta[cid],
-            mixed[cid] / mixed_total, wr_adj, threat, kda_champ, kda_adj,
+            mixed[cid], wr_adj, threat, kda_champ, kda_adj,
         )
 
     rank = repo.get_latest_rank_snapshot(player_id, RANKED_SOLO_QUEUE_TYPE)
     if rank is None or (rank["tier"] or "").upper() not in TIERS:
         notes.append(f"{label}: no recognized solo-queue tier at cutoff; placeholder rank weight = 1.")
     score = solo_rank_score(rank["tier"], rank["lp"]) if rank else 1.0
-    return PlayerModel(player_id, label, role, champions, baseline, score, tuple(notes), kda_baseline)
+    return PlayerModel(player_id, label, role, champions, baseline, score, tuple(notes), kda_baseline, p_others)
 
 
 def arithmetic_mean(residuals: Sequence[float], weights: Sequence[float]) -> float:
@@ -260,7 +267,7 @@ def _exhaustive_search(
     residuals_for: Callable[[Collection[int]], tuple[float, ...]],
     weights: tuple[float, ...],
     aggregate: Callable[[Sequence[float], Sequence[float]], float],
-    player_ids: tuple[int, ...],
+    exhausted_for: Callable[[Collection[int]], tuple[int, ...]],
 ) -> SearchResult:
     best_bans = None
     best_value = math.inf
@@ -271,7 +278,7 @@ def _exhaustive_search(
     for bans in combinations(candidates, BAN_COUNT):
         checked += 1
         residuals = residuals_for(bans)
-        exhausted_ids = tuple(pid for pid, r in zip(player_ids, residuals) if r == 0)
+        exhausted_ids = exhausted_for(bans)
         exhausted += bool(exhausted_ids)
         value = aggregate(residuals, weights)
         # Sorted IDs and strict comparison give deterministic lexicographic ties.
@@ -296,9 +303,12 @@ def recommend_bans(repo: ScoutingRepo, opponents: Sequence[tuple[int, str]]) -> 
     def residuals_for(bans: Collection[int]) -> tuple[float, ...]:
         return tuple(p.strength(bans) / baseline for p, baseline in zip(players, baselines))
 
+    def exhausted_for(bans: Collection[int]) -> tuple[int, ...]:
+        return tuple(p.player_id for p in players if p.observed_pool_exhausted(bans))
+
     best_by_rho = {
         rho: _exhaustive_search(
-            candidates, residuals_for, weights, aggregate, tuple(p.player_id for p in players)
+            candidates, residuals_for, weights, aggregate, exhausted_for
         )
         for rho, aggregate in ((1, arithmetic_mean), (0, geometric_mean), (-1, harmonic_mean))
     }
@@ -307,9 +317,8 @@ def recommend_bans(repo: ScoutingRepo, opponents: Sequence[tuple[int, str]]) -> 
     notes = [note for p in players for note in p.warnings]
     if any(result.exhausted_player_ids for result in best_by_rho.values()):
         notes.append(
-            "An optimum exhausts an observed role champion pool: v1 assumes S=0 and r=0. "
-            "With no unseen/Others bucket, this optimistic assumption can show 100% "
-            "threat reduction under rho=0 or rho=-1."
+            "An optimum exhausts an observed role champion pool: strength now relies "
+            "on the unseen-champion Others estimate (neutral threat = 1), not zero strength."
         )
 
     def impact(cid: int, marginal: float, resulting_bans: Collection[int]) -> BanImpact:
@@ -339,8 +348,8 @@ def recommend_bans(repo: ScoutingRepo, opponents: Sequence[tuple[int, str]]) -> 
     alternatives.sort(key=lambda b: (-b.marginal, b.champion_id))
     if any(b.exhausted_player_ids for b in alternatives[:5]):
         notes.append(
-            "An also-consider set exhausts an observed pool; its marginal value includes "
-            "the optimistic v1 S=0 assumption (unseen/Others picks are not modeled)."
+            "An also-consider set exhausts an observed pool; strength for that player "
+            "relies on the unseen-champion Others estimate (neutral threat = 1)."
         )
     shared = set.intersection(*(set(result.bans) for result in best_by_rho.values()))
     if len(shared) < 2:

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import discord
 
 import champion_data
+import champion_emoji
 from ban_algorithm import (
     BanImpact, ChampionModel, PlayerDiagnostic, PlayerModel, Recommendation,
     SearchResult,
@@ -89,6 +90,15 @@ class ReportRendererTests(unittest.TestCase):
         )
         self.champion_name_patch.start()
         self.addCleanup(self.champion_name_patch.stop)
+        # Same reasoning for the icon emoji cache - default to "not synced yet"
+        # so tests aren't sensitive to whatever happens to be on this machine's
+        # disk (data/discord_emojis.json is only ever written by a real,
+        # logged-in bot running sync_champion_emojis()).
+        self.champion_emoji_patch = patch.object(
+            champion_emoji, "emoji_markup", side_effect=champion_emoji.ChampionEmojiNotLoadedError("no cache")
+        )
+        self.champion_emoji_patch.start()
+        self.addCleanup(self.champion_emoji_patch.stop)
 
     def assert_embed_limits(self, embed):
         self.assertLessEqual(utf16_length(embed.title or ""), 256)
@@ -116,6 +126,25 @@ class ReportRendererTests(unittest.TestCase):
         self.assertIn("잭스야", text)
         self.assertNotIn("DbStoredEnglishName", text)
         self.champion_name_patch.start()
+
+    def test_champion_emoji_prefixes_the_name_when_available(self):
+        with patch.object(champion_emoji, "emoji_markup", side_effect=lambda cid: {1: "<:champ_1:999>"}.get(cid)):
+            player = replace(self.result.players[0], champions={
+                1: champion(1, 1.0, 1.0, name="잭스"),
+            })
+            text = embed_text(render_player_page(self.result, player, presentation(), 0))
+        self.assertIn("<:champ_1:999> 잭스", text)
+
+    def test_champion_emoji_cache_missing_falls_back_to_name_only(self):
+        # Already covered implicitly by every other test (setUp makes the
+        # emoji cache raise), but assert it explicitly so a future refactor
+        # can't silently start crashing reports instead.
+        player = replace(self.result.players[0], champions={
+            1: champion(1, 1.0, 1.0, name="잭스"),
+        })
+        text = embed_text(render_player_page(self.result, player, presentation(), 0))
+        self.assertIn("잭스", text)
+        self.assertNotIn("<:champ_", text)
 
     def test_champion_data_cache_missing_falls_back_to_db_name(self):
         # Already covered implicitly by every other test (setUp makes the
@@ -263,7 +292,7 @@ class ReportRendererTests(unittest.TestCase):
                 text = embed_text(render_summary_page(result))
                 self.assertIn("관측", text)
                 self.assertIn("미관측 챔피언", text)
-                self.assertIn("실제 효과", text)
+                self.assertIn("추정값", text)
                 self.assertIn("⚠", text)
 
     def test_missing_profile_and_rank_metadata_is_readable(self):
@@ -296,11 +325,16 @@ class ScoutingReportViewTests(unittest.IsolatedAsyncioTestCase):
         )
         self.champion_name_patch.start()
         self.addCleanup(self.champion_name_patch.stop)
+        self.champion_emoji_patch = patch.object(
+            champion_emoji, "emoji_markup", side_effect=champion_emoji.ChampionEmojiNotLoadedError("no cache")
+        )
+        self.champion_emoji_patch.start()
+        self.addCleanup(self.champion_emoji_patch.stop)
         self.result = recommendation()
         self.presentations = {p.player_id: presentation(i) for i, p in enumerate(self.result.players)}
         # Ordering must come from roles even if the caller's tuple is reordered.
         self.view = ScoutingReportView(replace(self.result, players=tuple(reversed(self.result.players))),
-                                       self.presentations, owner_id=123, timeout=600)
+                                       self.presentations, owner_id=123)
         self.addCleanup(self.view.stop)
 
     def interaction(self, user_id=123):
@@ -349,23 +383,36 @@ class ScoutingReportViewTests(unittest.IsolatedAsyncioTestCase):
             await button(self.view, "이전").callback(interaction)
         self.assertEqual(self.view.page_index, 0)
 
-    async def test_timeout_disables_navigation_and_handles_missing_message(self):
-        self.view.message = SimpleNamespace(edit=AsyncMock())
-        await self.view.on_timeout()
-        self.assertTrue(button(self.view, "이전").disabled)
-        self.assertTrue(button(self.view, "다음").disabled)
-        self.view.message.edit.assert_awaited_once()
-        no_message = ScoutingReportView(self.result, {}, owner_id=123)
-        self.addCleanup(no_message.stop)
-        await no_message.on_timeout()
-        self.assertTrue(button(no_message, "이전").disabled)
-        self.assertTrue(button(no_message, "다음").disabled)
+    def test_view_is_persistent_with_stable_custom_ids(self):
+        # Scouting reports must stay browsable indefinitely, and survive a bot
+        # restart: timeout=None plus fixed custom_id per button is what lets
+        # discord.py route interactions on old messages to a freshly
+        # registered view after the original Python object is gone.
+        self.assertIsNone(self.view.timeout)
+        self.assertEqual(button(self.view, "이전").custom_id, ScoutingReportView.PREV_CUSTOM_ID)
+        self.assertEqual(button(self.view, "다음").custom_id, ScoutingReportView.NEXT_CUSTOM_ID)
+        self.assertEqual(ScoutingReportView.PREV_CUSTOM_ID, "banreport:prev")
+        self.assertEqual(ScoutingReportView.NEXT_CUSTOM_ID, "banreport:next")
 
-    async def test_timeout_handles_deleted_discord_message(self):
-        response = SimpleNamespace(status=404, reason="Not Found")
-        self.view.message = SimpleNamespace(edit=AsyncMock(side_effect=discord.NotFound(response, {"message": "Unknown Message", "code": 10008})))
-        await self.view.on_timeout()
-        self.assertTrue(button(self.view, "다음").disabled)
+    async def test_on_page_change_hook_fires_with_new_index_after_message_is_set(self):
+        on_page_change = AsyncMock()
+        view = ScoutingReportView(self.result, self.presentations, owner_id=123, on_page_change=on_page_change)
+        self.addCleanup(view.stop)
+        interaction = self.interaction()
+        interaction.message = SimpleNamespace()
+        await button(view, "다음").callback(interaction)
+        on_page_change.assert_awaited_once_with(view, 1)
+        self.assertIs(view.message, interaction.message)
+
+    def test_constructor_accepts_and_clamps_an_initial_page_index(self):
+        # Revival after a restart resumes at (roughly) the last-seen page
+        # rather than always restarting at page 0.
+        view = ScoutingReportView(self.result, self.presentations, owner_id=123, page_index=3)
+        self.addCleanup(view.stop)
+        self.assertEqual(view.page_index, 3)
+        out_of_range = ScoutingReportView(self.result, self.presentations, owner_id=123, page_index=99)
+        self.addCleanup(out_of_range.stop)
+        self.assertEqual(out_of_range.page_index, 5)
 
 
 if __name__ == "__main__":

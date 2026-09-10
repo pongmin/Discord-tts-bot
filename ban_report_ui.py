@@ -5,6 +5,7 @@ reads, scoring, or recommendation searches; the text formatter remains separate.
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import logging
 import math
@@ -13,6 +14,7 @@ import re
 import discord
 
 import champion_data
+import champion_emoji
 from ban_algorithm import BanImpact, PlayerModel, Recommendation
 
 
@@ -27,8 +29,8 @@ TIER_LABELS = {
 }
 MAX_DISPLAY_CHAMPIONS = 8
 EXHAUSTION_WARNING = (
-    "한 선수의 관측 챔피언 풀이 모두 밴됩니다. 미관측 챔피언은 모델링하지 "
-    "않으므로 실제 효과는 표시값보다 낮을 수 있습니다."
+    "관측된 챔피언 풀이 모두 밴되어 미관측 챔피언 추정값을 사용 중입니다. "
+    "해당 선수의 포지션 평균 수준으로 추정하며, 전투력이 0이라는 뜻은 아닙니다."
 )
 
 
@@ -93,6 +95,26 @@ def _champion_name(champion_id: int | None, fallback: str) -> str:
     return "이름 미확인 챔피언" if str(fallback).isdigit() else _display(fallback, 64)
 
 
+def _champion_label(champion_id: int | None, fallback: str) -> str:
+    """
+    _champion_name() 앞에 인라인 챔피언 아이콘 이모지(champion_emoji.py)를
+    붙임. 이모지 캐시가 없거나(sync_champion_emojis()를 아직 안 돌렸거나)
+    그 챔피언이 아직 업로드 안 됐으면 아이콘 없이 이름만 보여줌 - 캐시 상태
+    때문에 리포트 자체가 실패하면 안 됨.
+    """
+    name = _champion_name(champion_id, fallback)
+
+    if champion_id is None:
+        return name
+
+    try:
+        markup = champion_emoji.emoji_markup(champion_id)
+    except champion_emoji.ChampionEmojiNotLoadedError:
+        markup = None
+
+    return f"{markup} {name}" if markup else name
+
+
 def _rank_text(presentation: PlayerPresentation) -> str:
     tier = (presentation.tier or "").upper()
     if tier not in TIER_LABELS:
@@ -130,8 +152,8 @@ def _warning_owner(result: Recommendation, warning: str) -> PlayerModel | None:
 
 
 def _translated_warning(warning: str) -> str:
-    if "no meta observations in the seen pool" in warning:
-        return "보유 챔피언의 포지션별 비교 기록이 부족해 개인 픽 기록을 기준으로 분석했습니다."
+    if "no meta observations" in warning:
+        return "포지션별 비교 기록이 없어 개인 픽 기록과 미관측 챔피언의 최소 안전 확률로 분석했습니다."
     if "no recognized solo-queue tier at cutoff" in warning:
         return "확인된 솔로랭크 티어가 없어 선수 간 비중 계산에 기본값을 사용했습니다."
     if "role-filtered games available" in warning:
@@ -143,7 +165,7 @@ def _translated_warning(warning: str) -> str:
         return EXHAUSTION_WARNING
     if "An also-consider set exhausts" in warning:
         return ("추가 고려 밴에 관측 챔피언 풀을 모두 소진하는 조합이 있습니다. "
-                "미관측 챔피언은 모델링하지 않으므로 실제 효과는 표시값보다 낮을 수 있습니다.")
+                "이 경우 미관측 챔피언 추정값으로 해당 선수의 포지션 평균 수준을 사용합니다.")
     if "sensitive to concentration assumption" in warning:
         return "선수별 주력 집중도를 반영하는 방식에 따라 추천 밴이 달라집니다. 안정성이 낮으므로 신중하게 선택하세요."
     if warning.startswith("Negative marginal contribution for "):
@@ -195,10 +217,10 @@ def _warnings(result: Recommendation, player: PlayerModel | None) -> list[str]:
             messages.append(f"{' · '.join(affected_roles)} 선수의 상세 페이지에 데이터 관련 주의사항이 있습니다.")
     elif player.player_id in main_exhausted:
         messages.append("추천 밴을 모두 적용하면 이 선수의 관측 챔피언 풀이 소진됩니다. "
-                        "미관측 챔피언은 반영하지 않아 실제 효과는 표시값보다 낮을 수 있습니다.")
+                        "미관측 챔피언 추정값으로 해당 선수의 포지션 평균 수준을 사용합니다.")
     elif player.player_id in compared_exhausted | extra_exhausted:
         messages.append("비교한 밴 조합 또는 추가 고려 밴에서 이 선수의 관측 챔피언 풀이 소진됩니다. "
-                        "미관측 챔피언은 반영하지 않아 효과가 과대평가될 수 있습니다.")
+                        "이 경우 미관측 챔피언 추정값으로 해당 선수의 포지션 평균 수준을 사용합니다.")
     # Equal known warnings are one caution; count future unrecognized notes so
     # several unrecognized diagnostics cannot disappear through deduplication.
     counts = {message: messages.count(message) for message in messages}
@@ -249,7 +271,7 @@ def render_player_page(
     top_three = math.fsum(champion.p_final for champion in champions[:3])
     embed.add_field(name="주력 집중도", value=f"최다 픽 {top_one:.1%}  ·  상위 3개 합 {top_three:.1%}", inline=False)
     blocks = [
-        f"**{index}. {_champion_name(champion.champion_id, champion.name)}**\n"
+        f"**{index}. {_champion_label(champion.champion_id, champion.name)}**\n"
         f"픽 비중 {champion.p_final:.1%} · 조정 승률 {champion.wr_adj:.1%}\n"
         f"조정 KDA {champion.kda_adj:.2f} · 위험도 {champion.threat:.2f} · {risk_label(champion.threat)}"
         for index, champion in enumerate(champions[:MAX_DISPLAY_CHAMPIONS], 1)
@@ -268,7 +290,7 @@ def _affected_players(result: Recommendation, impact: BanImpact) -> list[PlayerM
 
 def _ban_line(result: Recommendation, impact: BanImpact, index: int) -> str:
     roles = " · ".join(ROLE_LABELS[player.role] for player in _affected_players(result, impact))
-    return f"**{index}. {_champion_name(impact.champion_id, impact.name)}** — {roles}\n영향도 {impact.marginal:.1%}"
+    return f"**{index}. {_champion_label(impact.champion_id, impact.name)}** — {roles}\n영향도 {impact.marginal:.1%}"
 
 
 def _reason(result: Recommendation, impact: BanImpact) -> str:
@@ -294,7 +316,7 @@ def render_summary_page(result: Recommendation) -> discord.Embed:
                 for index, impact in enumerate(result.recommended, 1)])
     embed.add_field(name="예상 상대 위협 감소", value=f"{result.threat_reduction:.1%}", inline=True)
     embed.add_field(name="추천 안정성", value=stability_label(result), inline=True)
-    _add_blocks(embed, "왜 이 밴인가?", [f"{_champion_name(impact.champion_id, impact.name)} · {_reason(result, impact)}"
+    _add_blocks(embed, "왜 이 밴인가?", [f"{_champion_label(impact.champion_id, impact.name)} · {_reason(result, impact)}"
                 for impact in result.recommended])
     _add_blocks(embed, "추가 고려 4~8위", [_ban_line(result, impact, index)
                 for index, impact in enumerate(result.also_consider[:5], 4)] or ["추가 고려할 챔피언이 없습니다."])
@@ -305,13 +327,33 @@ def render_summary_page(result: Recommendation) -> discord.Embed:
 
 
 class ScoutingReportView(discord.ui.View):
-    def __init__(self, result: Recommendation, presentations: dict[int, PlayerPresentation],
-                 *, owner_id: int, timeout: float = 600):
-        super().__init__(timeout=timeout)
+    """
+    6페이지 스카우팅 리포트 view. 스카우팅 리포트는 오래 열어볼 수 있어야 하므로
+    timeout=None(persistent view)으로 두고, 버튼에는 프로세스 재시작 후에도
+    같은 문자열로 유지되는 고정 custom_id를 둠 - 그래야 discord.py가 재시작 후
+    (원래 이 view 객체는 사라진 상태에서도) 같은 custom_id로 등록해 둔
+    ban_commands.PersistentBanReportRouter로 인터랙션을 넘겨줄 수 있음.
+
+    on_page_change(self, new_page_index)가 주어지면 페이지가 바뀔 때마다
+    await됨 - DB에 현재 페이지를 기록해서 재시작 후 복구할 때 마지막으로 보던
+    페이지부터 이어서 열리게 하는 용도(ban_commands.py가 주입함). 이 클래스
+    자체는 어떤 DB도 알지 못함(순수 렌더링/인터랙션만 담당).
+    """
+
+    PREV_CUSTOM_ID = "banreport:prev"
+    NEXT_CUSTOM_ID = "banreport:next"
+
+    def __init__(
+        self, result: Recommendation, presentations: dict[int, PlayerPresentation],
+        *, owner_id: int, page_index: int = 0,
+        on_page_change: Callable[["ScoutingReportView", int], Awaitable[None]] | None = None,
+    ):
+        super().__init__(timeout=None)
         self.result = result
         self.presentations = presentations
         self.owner_id = owner_id
-        self.page_index = 0
+        self.page_index = max(0, min(5, page_index))
+        self.on_page_change = on_page_change
         self.message: discord.Message | discord.InteractionMessage | None = None
         self._page_lock = asyncio.Lock()
         by_role = {player.role: player for player in result.players}
@@ -355,29 +397,13 @@ class ScoutingReportView(discord.ui.View):
                 # Component messages edit with bot authentication, avoiding the
                 # original slash interaction's 15-minute token lifetime.
                 self.message = interaction.message
+            if self.on_page_change is not None:
+                await self.on_page_change(self, self.page_index)
 
-    @discord.ui.button(label="이전", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="이전", style=discord.ButtonStyle.secondary, row=0, custom_id=PREV_CUSTOM_ID)
     async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._move(interaction, -1)
 
-    @discord.ui.button(label="다음", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="다음", style=discord.ButtonStyle.primary, row=0, custom_id=NEXT_CUSTOM_ID)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._move(interaction, 1)
-
-    async def on_timeout(self) -> None:
-        async with self._page_lock:
-            self.previous_page.disabled = True
-            self.next_page.disabled = True
-            if self.message is not None:
-                try:
-                    message = self.message
-                    if isinstance(message, discord.InteractionMessage):
-                        # An expensive collection may leave the original
-                        # webhook token expired even before this View times out.
-                        # A channel partial message edits with the bot token.
-                        message = discord.PartialMessage(channel=message.channel, id=message.id)
-                    await message.edit(view=self)
-                except discord.HTTPException:
-                    # A deleted message or expired original interaction must
-                    # not turn successful collection into a command failure.
-                    logger.info("Could not disable expired scouting report controls", exc_info=True)

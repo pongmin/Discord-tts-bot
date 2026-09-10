@@ -82,7 +82,7 @@ class KdaThreatTests(unittest.TestCase):
         self.assertNotAlmostEqual(model.champions[1].kda_champ, (7 + 0.1) / 2)
         weighted_a = math.exp(-1 / 30) + math.exp(-60 / 30)
         weighted_b = 0.3 * math.exp(-90 / 30)
-        self.assertAlmostEqual(model.champions[1].p_final, weighted_a / (weighted_a + weighted_b))
+        self.assertAlmostEqual(model.champions[1].p_final, (1 - model.p_others) * weighted_a / (weighted_a + weighted_b))
         self.assert_finite_model(model)
 
     def test_date_and_queue_weights_change_only_picks(self):

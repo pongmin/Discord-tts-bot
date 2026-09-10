@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import itertools
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
@@ -95,7 +96,7 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         report = await asyncio.to_thread(command._recommend_report, opponents)
         self.assertIn("observed_pool_exhausted=True", report)
         self.assertIn("WARNING:", report)
-        self.assertIn("100.00%", report)
+        self.assertNotIn("100.00%", report)
         self.assertIn("rho=-1", report)
         self.assertEqual(hashlib.sha256(Path("ban_algorithm.py").read_bytes()).digest(), before)
 
@@ -158,9 +159,15 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(bot.tree.get_command("clashlookup"), clash)
         return bot.tree.get_command("banrecommend")
 
-    @staticmethod
-    def _interaction(user_id: int = 123, guild_id: int = 555):
+    _next_message_id = itertools.count(10_000_000)
+
+    @classmethod
+    def _interaction(cls, user_id: int = 123, guild_id: int = 555):
         channel = SimpleNamespace(id=999, send=AsyncMock())
+        # channel.send must return something with a real int .id: the
+        # persistent-report code path stores it as a SQLite PK
+        # (scouting_db.save_ban_report), which a bare MagicMock id can't bind.
+        channel.send.side_effect = lambda *a, **kw: SimpleNamespace(id=next(cls._next_message_id))
         interaction = SimpleNamespace(
             user=SimpleNamespace(id=user_id), guild_id=guild_id, channel=channel,
             response=SimpleNamespace(send_message=AsyncMock()),
@@ -216,7 +223,15 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(view.stop)
         self.assertEqual(view.page_index, 0)
         self.assertIn("TOP", sent["embed"].title)
-        self.assertEqual(view.message, channel.send.return_value)
+        self.assertIsNotNone(view.message)
+
+        # Enough is persisted (message_id -> opponents+cutoff, not the computed
+        # Recommendation itself) that navigation would survive a bot restart.
+        row = db.get_ban_report(self.anchor, view.message.id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["owner_id"], 123)
+        self.assertEqual(row["page_index"], 0)
+        self.assertEqual(len(db.ban_report_opponents(row)), 5)
 
     async def test_failure_is_reported_to_the_channel_with_the_failing_player_and_stage(self):
         slash = self._bot_with_ban_commands()
@@ -347,7 +362,7 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Player0#TEST/TOP: only 2 role-filtered games available", report)
         self.assertIn("Consider a deeper --depth if more history exists.", report)
         self.assertIn("observed_pool_exhausted=True", report)
-        self.assertIn("optimistic", report)
+        self.assertIn("unseen-champion Others estimate", report)
         self.assertEqual(report.count("only 2 role-filtered games available"), 5)
 
     async def test_invalid_depth_does_not_start_lookup(self):
@@ -359,6 +374,89 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         message = command._error_text(ValueError("At least 3 distinct candidate champions are required for a 3-ban search."))
         self.assertIn("3종 미만", message)
         self.assertNotIn("candidate", message)
+
+    async def test_persistent_router_is_registered_at_setup(self):
+        bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+        self.addAsyncCleanup(bot.close)
+        command.setup_ban_commands(bot)
+        custom_ids = {
+            child.custom_id
+            for view in bot.persistent_views
+            for child in view.children
+            if getattr(child, "custom_id", None)
+        }
+        self.assertIn(command.ScoutingReportView.PREV_CUSTOM_ID, custom_ids)
+        self.assertIn(command.ScoutingReportView.NEXT_CUSTOM_ID, custom_ids)
+
+    @staticmethod
+    def _find_button(view, label):
+        return next(child for child in view.children if getattr(child, "label", None) == label)
+
+    @staticmethod
+    def _router_interaction(user_id: int, message_id: int):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id), message=SimpleNamespace(id=message_id),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            edit_original_response=AsyncMock(),
+        )
+
+    async def _send_one_report(self):
+        """Runs a full successful job and returns (owner_id, message_id)."""
+        slash = self._bot_with_ban_commands()
+        interaction, channel = self._interaction()
+        await slash.callback(interaction, **self.inputs)
+        key = command._team_key(command.parse_inputs(self.inputs))
+        await self.jobs.get(key).task
+        view = channel.send.call_args.kwargs["view"]
+        self.addCleanup(view.stop)
+        return interaction.user.id, view.message.id
+
+    async def test_persistent_router_revives_a_report_after_a_restart(self):
+        owner_id, message_id = await self._send_one_report()
+
+        # A brand-new router with zero in-memory state, as if the process had
+        # just restarted and lost the original ScoutingReportView instance -
+        # only scouting.db (ban_reports) still knows about this message.
+        router = command.PersistentBanReportRouter()
+        self.addCleanup(router.stop)
+        interaction = self._router_interaction(owner_id, message_id)
+
+        await self._find_button(router, "다음").callback(interaction)
+
+        interaction.response.defer.assert_awaited_once()
+        interaction.edit_original_response.assert_awaited_once()
+        revived = interaction.edit_original_response.call_args.kwargs["view"]
+        self.addCleanup(revived.stop)
+        self.assertEqual(revived.page_index, 1)
+        self.assertIn("JUNGLE", interaction.edit_original_response.call_args.kwargs["embed"].title)
+
+        row = db.get_ban_report(self.anchor, message_id)
+        self.assertEqual(row["page_index"], 1)
+
+    async def test_persistent_router_rejects_non_owner(self):
+        owner_id, message_id = await self._send_one_report()
+        router = command.PersistentBanReportRouter()
+        self.addCleanup(router.stop)
+        interaction = self._router_interaction(owner_id + 1, message_id)
+
+        await self._find_button(router, "다음").callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        self.assertTrue(interaction.response.send_message.call_args.kwargs["ephemeral"])
+        interaction.response.defer.assert_not_awaited()
+        row = db.get_ban_report(self.anchor, message_id)
+        self.assertEqual(row["page_index"], 0)
+
+    async def test_persistent_router_handles_a_report_it_never_saved(self):
+        router = command.PersistentBanReportRouter()
+        self.addCleanup(router.stop)
+        interaction = self._router_interaction(123, 999999999)
+
+        await self._find_button(router, "이전").callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        self.assertIn("다시 실행", interaction.response.send_message.call_args.args[0])
+        interaction.response.defer.assert_not_awaited()
 
 
 if __name__ == "__main__":

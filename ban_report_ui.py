@@ -251,7 +251,7 @@ def render_player_page(
     blocks = [
         f"**{index}. {_champion_name(champion.champion_id, champion.name)}**\n"
         f"픽 비중 {champion.p_final:.1%} · 조정 승률 {champion.wr_adj:.1%}\n"
-        f"위험도 {champion.threat:.2f} · {risk_label(champion.threat)}"
+        f"조정 KDA {champion.kda_adj:.2f} · 위험도 {champion.threat:.2f} · {risk_label(champion.threat)}"
         for index, champion in enumerate(champions[:MAX_DISPLAY_CHAMPIONS], 1)
     ]
     if len(champions) > MAX_DISPLAY_CHAMPIONS:

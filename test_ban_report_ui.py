@@ -161,6 +161,18 @@ class ReportRendererTests(unittest.TestCase):
                 for other in {"▼ 낮음", "보통", "▲ 높음"} - {expected}:
                     self.assertNotIn(other, text)
 
+    def test_adjusted_kda_is_shown_without_extra_debug_fields(self):
+        player = replace(self.result.players[0], champions={
+            1: replace(champion(1, 1.0), kda_champ=9.87654321, kda_adj=3.456789),
+        })
+        embed = render_player_page(self.result, player, presentation(), 0)
+        text = embed_text(embed)
+        self.assertIn("조정 KDA 3.46", text)
+        self.assertIn("위험도", text)
+        self.assertNotIn("9.87654321", text)
+        self.assertNotIn("kda_adj", text)
+        self.assert_embed_limits(embed)
+
     def test_concentration_uses_full_pool_before_display_truncation(self):
         shares = [0.4, 0.3, 0.1] + [0.002] * 100
         player = replace(self.result.players[0], champions={

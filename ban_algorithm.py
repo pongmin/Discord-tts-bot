@@ -1,8 +1,9 @@
 """Observed-pool ban recommendations, v1. No API calls or parameter tuning.
 
 Pick probabilities use dated, queue-weighted observations. Threat uses raw
-role-filtered wins/games. Meta rates use all other same-role participants across
-patches; the 15% mixture is then normalized over the player's observed pool.
+role-filtered wins/games and a weak, shrunk KDA signal. Meta rates use all other
+same-role participants across patches; the 15% mixture is then normalized over
+the player's observed pool.
 
 No Others bucket exists: exhausting an observed pool gives S=0 and r=0 in v1.
 This optimistic convention can yield 100% team threat reduction for geometric
@@ -24,6 +25,8 @@ GAMMA = 0.3
 LAMBDA = 0.15
 K = 8
 BETA = 4
+ALPHA = 0.4
+KDA_EPSILON = 1e-6
 TOP_CANDIDATES = 8
 BAN_COUNT = 3
 DAY_MS = 24 * 60 * 60 * 1000
@@ -46,6 +49,8 @@ class ChampionModel:
     p_final: float
     wr_adj: float
     threat: float
+    kda_champ: float = 0.0
+    kda_adj: float = 0.0
 
     @property
     def candidate_score(self) -> float:
@@ -62,6 +67,7 @@ class PlayerModel:
     baseline_winrate: float
     rank_score: float
     warnings: tuple[str, ...] = ()
+    kda_baseline: float = 0.0
 
     def strength(self, bans: Collection[int] = frozenset()) -> float:
         remaining = [c for cid, c in self.champions.items() if cid not in bans]
@@ -164,11 +170,17 @@ def build_player_model(repo: ScoutingRepo, player_id: int, role: str) -> PlayerM
 
     games = Counter(row["champion_id"] for row in rows)
     wins = Counter()
+    takedowns = Counter()
+    deaths = Counter()
     names = {}
     log_weights = []
     for row in rows:
         cid = row["champion_id"]
         wins[cid] += row["win"]
+        # Raw role-filtered totals, including the champion itself in baseline.
+        # Nullable legacy rows contribute zero for absent K/D/A counts.
+        takedowns[cid] += (row["kills"] or 0) + (row["assists"] or 0)
+        deaths[cid] += row["deaths"] or 0
         names[cid] = row["champion_name"] or str(cid)
         days_ago = max(0, repo.cutoff_time - row["game_start"]) / DAY_MS
         log_weights.append(math.log(QUEUE_WEIGHTS[row["queue_id"]]) - days_ago / TAU)
@@ -198,21 +210,28 @@ def build_player_model(repo: ScoutingRepo, player_id: int, role: str) -> PlayerM
     mixed = {cid: (1 - LAMBDA) * personal[cid] + LAMBDA * meta[cid] for cid in games}
     mixed_total = math.fsum(mixed.values())
 
-    # The specification weights picks only; wins/games for shrinkage are raw.
+    # Date/queue weights apply only to picks; WR and KDA performance is raw.
     baseline = sum(wins.values()) / len(rows)
+    kda_baseline = sum(takedowns.values()) / max(1, sum(deaths.values()))
     champions = {}
     for cid in sorted(games):
         wr_adj = (wins[cid] + K * baseline) / (games[cid] + K)
+        kda_champ = takedowns[cid] / max(1, deaths[cid])
+        kda_adj = (games[cid] * kda_champ + K * kda_baseline) / (games[cid] + K)
+        kda_log_ratio = math.log(
+            max(kda_adj, KDA_EPSILON) / max(kda_baseline, KDA_EPSILON)
+        )
+        threat = math.exp(BETA * (wr_adj - baseline) + ALPHA * kda_log_ratio)
         champions[cid] = ChampionModel(
             cid, names[cid], games[cid], wins[cid], personal[cid], meta[cid],
-            mixed[cid] / mixed_total, wr_adj, math.exp(BETA * (wr_adj - baseline)),
+            mixed[cid] / mixed_total, wr_adj, threat, kda_champ, kda_adj,
         )
 
     rank = repo.get_latest_rank_snapshot(player_id, RANKED_SOLO_QUEUE_TYPE)
     if rank is None or (rank["tier"] or "").upper() not in TIERS:
         notes.append(f"{label}: no recognized solo-queue tier at cutoff; placeholder rank weight = 1.")
     score = solo_rank_score(rank["tier"], rank["lp"]) if rank else 1.0
-    return PlayerModel(player_id, label, role, champions, baseline, score, tuple(notes))
+    return PlayerModel(player_id, label, role, champions, baseline, score, tuple(notes), kda_baseline)
 
 
 def arithmetic_mean(residuals: Sequence[float], weights: Sequence[float]) -> float:

@@ -7,6 +7,7 @@ the printed Pongmin diagnostics by eye; this is not an evaluation harness.
 """
 
 import argparse
+import math
 from contextlib import closing
 from pathlib import Path
 import sqlite3
@@ -14,6 +15,7 @@ import sys
 from uuid import uuid4
 
 from ban_algorithm import (
+    BETA,
     arithmetic_mean,
     build_player_model,
     format_recommendation,
@@ -147,13 +149,17 @@ def main() -> int:
                 print(f"  observed_pool_exhausted({{X}}): {pongmin.observed_pool_exhausted(top_ban)}")
                 print(
                     f"  BOTTOM, queues 420+400: {sum(c.games for c in pongmin.champions.values())} games, "
-                    f"{len(pongmin.champions)} champions; baseline WR={pongmin.baseline_winrate:.3f}"
+                    f"{len(pongmin.champions)} champions; baseline WR={pongmin.baseline_winrate:.3f}, "
+                    f"baseline KDA={pongmin.kda_baseline:.3f}"
                 )
                 for champion in sorted(pongmin.champions.values(), key=lambda c: (-c.p_final, c.champion_id)):
                     print(
                         f"    {champion.name}: {champion.wins}/{champion.games} wins, "
                         f"P_personal={champion.p_personal:.3f}, P_meta={champion.p_meta:.3f}, "
-                        f"P_final={champion.p_final:.3f}, WR_adj={champion.wr_adj:.3f}, T={champion.threat:.3f}"
+                        f"P_final={champion.p_final:.3f}, WR_adj={champion.wr_adj:.3f}, "
+                        f"KDA={champion.kda_champ:.3f}, KDA_adj={champion.kda_adj:.3f}, "
+                        f"T_WR_only={math.exp(BETA * (champion.wr_adj - pongmin.baseline_winrate)):.3f}, "
+                        f"T_with_KDA={champion.threat:.3f}"
                     )
                 print("  Inspect these values by eye; no automatic Pongmin pass/fail assertion.\n", flush=True)
                 companions = add_synthetic_companions(conn, cutoff)

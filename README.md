@@ -65,7 +65,12 @@ TOP → JUNGLE → MID → BOTTOM → SUPPORT → 종합 밴 추천 순서로 �
 해당 상세 페이지에, 풀 소진과 추천 안정성 경고는 종합 페이지에 한글로 안내합니다.
 페이지 이동은 요청한 사용자만 할 수 있으며 10분 동안 조작하지 않으면 버튼이 만료됩니다.
 Discord 표시 코드는 `ban_report_ui.py`와 `ban_report_assets.py`에 분리되어 있고,
-`format_recommendation()`은 로컬 수동 확인용으로 유지됩니다.
+`format_recommendation()`은 로컬 수동 확인용으로 유지됩니다. 챔피언 이름은
+Data Dragon 캐시(`champion_data.py`, 기본 로케일 ko_KR)를 champion_id로 조회해
+한글로 표시하며, 봇 시작 시(`on_ready`) 한 번 자동으로 캐시를 받아둡니다.
+캐시가 아직 없거나 그 버전에 없는 챔피언은 DB에 저장된 Riot 내부 영문 이름으로
+조용히 대체되므로(리포트 자체는 실패하지 않음), 최신 챔피언을 바로 한글로
+보고 싶으면 `python champion_data.py --force`로 캐시를 갱신하세요.
 
 계정 조회·수집·추천 계산은 슬래시 커맨드 응답과 분리된 백그라운드 job으로
 실행됩니다(`scouting_job_manager.py`). 명령을 실행하면 입력 형식만 즉시

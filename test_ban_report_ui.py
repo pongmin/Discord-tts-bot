@@ -4,10 +4,11 @@ from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import discord
 
+import champion_data
 from ban_algorithm import (
     BanImpact, ChampionModel, PlayerDiagnostic, PlayerModel, Recommendation,
     SearchResult,
@@ -79,6 +80,15 @@ def button(view, label):
 class ReportRendererTests(unittest.TestCase):
     def setUp(self):
         self.result = recommendation()
+        # Simulate "Data Dragon cache not populated yet" by default, so
+        # existing assertions keep exercising the fallback-to-DB-name path
+        # with the fixture's own (already-Korean) names. Tests that care about
+        # the Data Dragon lookup taking precedence patch this differently.
+        self.champion_name_patch = patch.object(
+            champion_data, "champion_name", side_effect=champion_data.ChampionDataNotLoadedError("no cache")
+        )
+        self.champion_name_patch.start()
+        self.addCleanup(self.champion_name_patch.stop)
 
     def assert_embed_limits(self, embed):
         self.assertLessEqual(utf16_length(embed.title or ""), 256)
@@ -92,6 +102,30 @@ class ReportRendererTests(unittest.TestCase):
         payload = [embed.title or "", embed.description or "", embed.footer.text or "", embed.author.name or ""]
         payload.extend(text for field in embed.fields for text in (field.name, field.value))
         self.assertLessEqual(sum(map(utf16_length, payload)), 6000)
+
+    def test_champion_data_cache_overrides_db_name_when_available(self):
+        # When the Data Dragon cache is populated, its (Korean) name wins over
+        # whatever is stored in scouting.db for that champion_id - the DB name
+        # is only a fallback for when the cache is missing/incomplete.
+        self.champion_name_patch.stop()
+        with patch.object(champion_data, "champion_name", side_effect=lambda cid: {1: "잭스야"}.get(cid)):
+            player = replace(self.result.players[0], champions={
+                1: champion(1, 1.0, 1.0, name="DbStoredEnglishName"),
+            })
+            text = embed_text(render_player_page(self.result, player, presentation(), 0))
+        self.assertIn("잭스야", text)
+        self.assertNotIn("DbStoredEnglishName", text)
+        self.champion_name_patch.start()
+
+    def test_champion_data_cache_missing_falls_back_to_db_name(self):
+        # Already covered implicitly by every other test (setUp makes the
+        # cache raise ChampionDataNotLoadedError), but assert it explicitly
+        # so a future refactor can't silently start crashing reports instead.
+        player = replace(self.result.players[0], champions={
+            1: champion(1, 1.0, 1.0, name="FallbackName"),
+        })
+        text = embed_text(render_player_page(self.result, player, presentation(), 0))
+        self.assertIn("FallbackName", text)
 
     def test_player_details_use_actual_role_games_and_pick_order(self):
         player = replace(self.result.players[0], champions={
@@ -245,6 +279,11 @@ class ReportRendererTests(unittest.TestCase):
 
 class ScoutingReportViewTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.champion_name_patch = patch.object(
+            champion_data, "champion_name", side_effect=champion_data.ChampionDataNotLoadedError("no cache")
+        )
+        self.champion_name_patch.start()
+        self.addCleanup(self.champion_name_patch.stop)
         self.result = recommendation()
         self.presentations = {p.player_id: presentation(i) for i, p in enumerate(self.result.players)}
         # Ordering must come from roles even if the caller's tuple is reordered.

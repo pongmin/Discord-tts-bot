@@ -8,6 +8,7 @@ import random
 import time
 from pathlib import Path
 
+import champion_data
 from gtts_session import close_gtts_session
 from http_session import close_session
 from tts_queue import add_tts_queue, add_bot_tts_queue
@@ -220,6 +221,19 @@ async def try_keyword_reaction(message: discord.Message):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user.name} - {bot.user.id}")
+
+    # 밴 추천 리포트가 챔피언 이름을 한글로 보여주려면 이 캐시가 있어야 함
+    # (champion_data.champion_name()은 캐시가 없으면 조용히 영문 이름으로
+    # 대체하므로 실패해도 봇은 계속 뜸). on_ready는 재연결 시 다시 불릴 수
+    # 있어 플래그로 한 번만 시도함 - 매 호출/명령마다 다시 받지 않음.
+    if not getattr(bot, "champion_data_ready", False):
+        try:
+            version = await champion_data.refresh_champion_data()
+            print(f"챔피언 데이터 캐시 준비됨: {version}")
+            bot.champion_data_ready = True
+
+        except Exception as e:
+            print("챔피언 데이터 캐시 갱신 실패 (영문 이름으로 대체됨):", repr(e))
 
     if not getattr(bot, "synced", False):
         all_ok = True

@@ -12,6 +12,7 @@ import re
 
 import discord
 
+import champion_data
 from ban_algorithm import BanImpact, PlayerModel, Recommendation
 
 
@@ -69,8 +70,27 @@ def _player_label(player: PlayerModel) -> str:
     return "이름 미확인 선수" if re.fullmatch(r"Player \d+", player.label) else _display(player.label)
 
 
-def _champion_name(name: str) -> str:
-    return "이름 미확인 챔피언" if str(name).isdigit() else _display(name, 64)
+def _champion_name(champion_id: int | None, fallback: str) -> str:
+    """
+    가능하면 Data Dragon 캐시(기본 한글, champion_data.py)에서 챔피언 이름을
+    찾아 보여줌. 캐시가 아직 없거나(champion_data.refresh_champion_data()를
+    아직 안 돌렸거나) 그 ID가 캐시에 없으면 DB에 저장된 이름(Riot 내부 영문
+    키)으로 대체함 - 캐시 상태 때문에 리포트 자체가 실패하면 안 되므로 항상
+    뭔가는 보여줌. champion_id를 모르는 호출(경고 문자열에서 정규식으로 뽑아낸
+    이름 등)은 fallback만 그대로 씀.
+    """
+    korean_name = None
+
+    if champion_id is not None:
+        try:
+            korean_name = champion_data.champion_name(champion_id)
+        except champion_data.ChampionDataNotLoadedError:
+            korean_name = None
+
+    if korean_name:
+        return _display(korean_name, 64)
+
+    return "이름 미확인 챔피언" if str(fallback).isdigit() else _display(fallback, 64)
 
 
 def _rank_text(presentation: PlayerPresentation) -> str:
@@ -128,7 +148,7 @@ def _translated_warning(warning: str) -> str:
         return "선수별 주력 집중도를 반영하는 방식에 따라 추천 밴이 달라집니다. 안정성이 낮으므로 신중하게 선택하세요."
     if warning.startswith("Negative marginal contribution for "):
         name = warning.removeprefix("Negative marginal contribution for ").split(" (", 1)[0]
-        return (f"{_champion_name(name)} 밴의 영향도가 음수입니다. "
+        return (f"{_champion_name(None, name)} 밴의 영향도가 음수입니다. "
                 "다른 챔피언으로 픽이 옮겨가 오히려 상대 위험도가 높아질 수 있습니다.")
     # Future diagnostics must remain visible without leaking English debug IDs.
     # Their full source is kept in logs; current algorithm warnings are all above.
@@ -229,7 +249,7 @@ def render_player_page(
     top_three = math.fsum(champion.p_final for champion in champions[:3])
     embed.add_field(name="주력 집중도", value=f"최다 픽 {top_one:.1%}  ·  상위 3개 합 {top_three:.1%}", inline=False)
     blocks = [
-        f"**{index}. {_champion_name(champion.name)}**\n"
+        f"**{index}. {_champion_name(champion.champion_id, champion.name)}**\n"
         f"픽 비중 {champion.p_final:.1%} · 조정 승률 {champion.wr_adj:.1%}\n"
         f"위험도 {champion.threat:.2f} · {risk_label(champion.threat)}"
         for index, champion in enumerate(champions[:MAX_DISPLAY_CHAMPIONS], 1)
@@ -248,7 +268,7 @@ def _affected_players(result: Recommendation, impact: BanImpact) -> list[PlayerM
 
 def _ban_line(result: Recommendation, impact: BanImpact, index: int) -> str:
     roles = " · ".join(ROLE_LABELS[player.role] for player in _affected_players(result, impact))
-    return f"**{index}. {_champion_name(impact.name)}** — {roles}\n영향도 {impact.marginal:.1%}"
+    return f"**{index}. {_champion_name(impact.champion_id, impact.name)}** — {roles}\n영향도 {impact.marginal:.1%}"
 
 
 def _reason(result: Recommendation, impact: BanImpact) -> str:
@@ -274,7 +294,7 @@ def render_summary_page(result: Recommendation) -> discord.Embed:
                 for index, impact in enumerate(result.recommended, 1)])
     embed.add_field(name="예상 상대 위협 감소", value=f"{result.threat_reduction:.1%}", inline=True)
     embed.add_field(name="추천 안정성", value=stability_label(result), inline=True)
-    _add_blocks(embed, "왜 이 밴인가?", [f"{_champion_name(impact.name)} · {_reason(result, impact)}"
+    _add_blocks(embed, "왜 이 밴인가?", [f"{_champion_name(impact.champion_id, impact.name)} · {_reason(result, impact)}"
                 for impact in result.recommended])
     _add_blocks(embed, "추가 고려 4~8위", [_ban_line(result, impact, index)
                 for index, impact in enumerate(result.also_consider[:5], 4)] or ["추가 고려할 챔피언이 없습니다."])

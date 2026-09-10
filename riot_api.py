@@ -18,10 +18,30 @@ ACCOUNT_BASE_URL = f"https://{ACCOUNT_ROUTE}.api.riotgames.com/riot/account/v1"
 CLASH_BASE_URL = f"https://{CLASH_ROUTE}.api.riotgames.com/lol/clash/v1"
 MATCH_BASE_URL = f"https://{MATCH_ROUTE}.api.riotgames.com/lol/match/v5"
 
-# 큐 ID: 솔로/듀오 랭크만 수집 대상. 자유랭크(440)는 수집하지 않음
+# 큐 ID (공식 목록: https://static.developer.riotgames.com/docs/lol/queues.json)
+#
+# 블라인드 픽(과거 430)은 12.9 패치에서 소환사의 협곡에서 사라졌고 그 자리를
+# 퀵플레이(490)가 대체함 - 지금 시점 기준 "일반 게임"은 드래프트(400)와
+# 퀵플레이(490) 둘 뿐이라 430은 의도적으로 넣지 않음.
 RANKED_SOLO_QUEUE_ID = 420
+NORMAL_DRAFT_QUEUE_ID = 400
+NORMAL_QUICKPLAY_QUEUE_ID = 490
 
-# Match-V5의 by-puuid/ids 엔드포인트가 한 번에 허용하는 최대 count
+# 랭크 자유. 스카우팅 수집 대상에서 명시적으로 제외함(ALLOWED_SCOUTING_QUEUE_IDS에 없음).
+RANKED_FLEX_QUEUE_ID = 440
+
+# collect_matches.py --queues / analyze_thickness.py --queues 가 허용하는 큐 목록.
+# 아레나(1700)나 이벤트성 큐(URF 등)가 실수로/API 오동작으로 섞여 들어오는 걸
+# 막기 위한 allow-list 역할도 함 - 여기 없는 큐 ID는 애초에 요청하지 않음.
+ALLOWED_SCOUTING_QUEUE_IDS: dict[int, str] = {
+    RANKED_SOLO_QUEUE_ID: "RANKED_SOLO",
+    NORMAL_DRAFT_QUEUE_ID: "NORMAL_DRAFT",
+    NORMAL_QUICKPLAY_QUEUE_ID: "NORMAL_QUICKPLAY",
+}
+
+# Match-V5의 by-puuid/ids 엔드포인트가 한 번에 허용하는 최대 count.
+# Riot 공식 문서(Match-V5 by-puuid/ids) 기준 실측 상한이며, 이 프로세스에는
+# 유효한 RIOT_API_KEY가 없어서 라이브 호출로 재확인하지는 못함.
 MATCH_IDS_PAGE_SIZE = 100
 
 
@@ -184,11 +204,11 @@ async def get_clash_team(team_id: str) -> list[ClashPlayer]:
 # Match-V5 (솔로 랭크 전용)
 # =========================
 
-async def get_solo_queue_match_ids(puuid: str, count: int = 200) -> list[str]:
+async def get_match_ids_by_queue(puuid: str, queue_id: int, count: int = 200) -> list[str]:
     """
-    최신 순으로 최대 count개의 솔로 랭크(큐 420) 매치 ID를 가져옴.
-    Riot API가 by-puuid/ids 한 번 호출당 허용하는 count 상한이 있어서
-    MATCH_IDS_PAGE_SIZE 단위로 나눠서 요청함.
+    최신 순으로 최대 count개의 매치 ID를 가져옴 (큐 하나 기준).
+    Riot API가 by-puuid/ids 한 번 호출당 허용하는 count 상한(MATCH_IDS_PAGE_SIZE)이
+    있어서, count가 그보다 크면 start를 옮겨가며 여러 번 나눠서 요청함.
     """
     match_ids: list[str] = []
     start = 0
@@ -199,7 +219,7 @@ async def get_solo_queue_match_ids(puuid: str, count: int = 200) -> list[str]:
 
         url = (
             f"{MATCH_BASE_URL}/matches/by-puuid/{puuid}/ids"
-            f"?start={start}&count={page_size}&queue={RANKED_SOLO_QUEUE_ID}"
+            f"?start={start}&count={page_size}&queue={queue_id}"
         )
         page = await _request_json(url)
 

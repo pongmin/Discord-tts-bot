@@ -5,7 +5,10 @@
   (라이엇이 puuid 체계를 바꾸거나, 한 선수가 여러 puuid를 가진 과거 데이터를 다룰 때
   외부 키가 아니라 내부 id로 참조를 고정하기 위함).
 - matches: Match-V5 원본 파일(raw_matches/<id>.json.gz)에 대한 색인.
-- player_matches: 선수별 파생 통계(챔피언, 포지션, 승패 등). 원본에서 언제든 재생성 가능.
+- player_matches: 매치당 10명 참가자 전원의 파생 통계(챔피언, 포지션, 승패 등).
+  원본에서 언제든 재생성 가능(reparse_matches.py). 수집을 직접 요청한 선수 외에는
+  game_name/tag_line을 모르는 채로(puuid만 알고) 들어올 수 있음 - 추가 API 호출 없이
+  puuid만으로 players에 등록되기 때문.
 - player_fetch_state: 선수+큐별 수집 진행 상황. 수집기가 재시작해도 이어서 할 수 있게 함.
 - fetch_failures: 실패 로그. retryable로 재시도 가능한 실패와 영구 실패를 구분함.
 
@@ -43,6 +46,7 @@ CREATE TABLE IF NOT EXISTS matches (
 );
 
 CREATE INDEX IF NOT EXISTS idx_matches_game_start ON matches(game_start);
+CREATE INDEX IF NOT EXISTS idx_matches_queue_id ON matches(queue_id);
 
 CREATE TABLE IF NOT EXISTS player_matches (
     player_id INTEGER NOT NULL,
@@ -59,13 +63,22 @@ CREATE TABLE IF NOT EXISTS player_matches (
     kills INTEGER,
     deaths INTEGER,
     assists INTEGER,
+    patch TEXT,
     PRIMARY KEY (player_id, match_id),
     FOREIGN KEY (player_id) REFERENCES players(id),
     FOREIGN KEY (match_id) REFERENCES matches(match_id)
 );
 
+-- PRIMARY KEY(player_id, match_id)가 이미 (player_id, match_id) 조회에 쓰이는
+-- 고유 인덱스라 별도 인덱스는 필요 없음.
 CREATE INDEX IF NOT EXISTS idx_player_matches_player_role
     ON player_matches(player_id, canonical_role);
+
+-- 챔피언별/포지션별/패치별 메타 픽률 집계용 (자체 데이터로 티어 메타를 낼 때 씀).
+-- patch는 matches.patch를 참가자 행에 복제해 둔 값이라, matches 조인 없이도
+-- player_matches 단독으로 이 집계를 낼 수 있음.
+CREATE INDEX IF NOT EXISTS idx_player_matches_champion_role_patch
+    ON player_matches(champion_id, canonical_role, patch);
 
 CREATE TABLE IF NOT EXISTS player_fetch_state (
     player_id INTEGER NOT NULL,
@@ -103,13 +116,62 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """
+    기존 DB를 지우지 않고 새 컬럼을 맞춰줌. SCHEMA의 CREATE TABLE은 새 DB에만
+    적용되므로(테이블이 이미 있으면 무시됨), 이미 만들어진 DB에 나중에 추가된
+    컬럼은 여기서 ALTER TABLE로 채워야 함.
+
+    반드시 executescript(SCHEMA)보다 먼저 실행해야 함: SCHEMA 안의
+    CREATE INDEX(...patch)가 patch 컬럼이 없는 옛 player_matches 테이블을
+    보고 바로 실패하기 때문 - 컬럼을 먼저 만들어 둬야 그 인덱스 생성이 통과함.
+    player_matches 테이블 자체가 아직 없는 새 DB에서는 CREATE TABLE이 이미
+    patch를 포함해서 만들 것이므로 여기선 손댈 게 없음.
+    """
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='player_matches'"
+    ).fetchone() is not None
+
+    if not table_exists:
+        return
+
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(player_matches)").fetchall()
+    }
+
+    if "patch" not in columns:
+        conn.execute("ALTER TABLE player_matches ADD COLUMN patch TEXT")
+
+    conn.commit()
+
+
+def _backfill_patch(conn: sqlite3.Connection) -> None:
+    """
+    patch가 비어 있는 player_matches 행을 matches.patch로 채움.
+    이미 채워진 행은 건드리지 않으니 몇 번을 다시 실행해도 안전함.
+    """
+    conn.execute(
+        """
+        UPDATE player_matches
+        SET patch = (
+            SELECT m.patch FROM matches m WHERE m.match_id = player_matches.match_id
+        )
+        WHERE patch IS NULL
+        """
+    )
+    conn.commit()
+
+
 def init_db(conn: sqlite3.Connection | None = None) -> None:
     owns_conn = conn is None
     conn = conn or get_connection()
 
     try:
+        _migrate(conn)
         conn.executescript(SCHEMA)
         conn.commit()
+        _backfill_patch(conn)
     finally:
         if owns_conn:
             conn.close()
@@ -226,15 +288,21 @@ def upsert_match(conn: sqlite3.Connection, match_id: str, match_row: dict, raw_f
     )
 
 
-def upsert_player_match(conn: sqlite3.Connection, player_id: int, match_id: str, participant_row: dict) -> None:
+def upsert_player_match(
+    conn: sqlite3.Connection,
+    player_id: int,
+    match_id: str,
+    participant_row: dict,
+    patch: str | None = None,
+) -> None:
     conn.execute(
         """
         INSERT INTO player_matches (
             player_id, match_id, team_id, participant_id, champion_id, champion_name,
             team_position, individual_position, canonical_role, role_mismatch,
-            win, kills, deaths, assists
+            win, kills, deaths, assists, patch
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(player_id, match_id) DO UPDATE SET
             team_id = excluded.team_id,
             participant_id = excluded.participant_id,
@@ -247,7 +315,8 @@ def upsert_player_match(conn: sqlite3.Connection, player_id: int, match_id: str,
             win = excluded.win,
             kills = excluded.kills,
             deaths = excluded.deaths,
-            assists = excluded.assists
+            assists = excluded.assists,
+            patch = excluded.patch
         """,
         (
             player_id,
@@ -264,6 +333,7 @@ def upsert_player_match(conn: sqlite3.Connection, player_id: int, match_id: str,
             participant_row["kills"],
             participant_row["deaths"],
             participant_row["assists"],
+            patch,
         )
     )
 

@@ -40,18 +40,31 @@ class ScoutingRepo:
             "SELECT * FROM players WHERE id = ?", (player_id,)
         ).fetchone()
 
+    @staticmethod
+    def _queue_in_clause(queue_ids: tuple[int, ...] | list[int]) -> tuple[str, tuple]:
+        queue_ids = tuple(queue_ids)
+
+        if not queue_ids:
+            raise ValueError("queue_ids는 비어 있을 수 없음")
+
+        placeholders = ",".join("?" for _ in queue_ids)
+        return f"m.queue_id IN ({placeholders})", queue_ids
+
     def get_role_matches(
         self,
         player_id: int,
         role: str,
-        queue_id: int = 420,
+        queue_ids: tuple[int, ...] | list[int] = (420,),
     ) -> list[sqlite3.Row]:
         """
-        해당 플레이어가 canonical_role == role로 뛴 경기를,
+        해당 플레이어가 canonical_role == role로 뛴 경기를(queue_ids에 속한 큐만),
         game_start 오름차순(과거 -> 최근)으로 반환함.
         cutoff_time 이후 경기는 절대 섞이지 않음.
+        pm.player_id로 걸러내므로, 매치당 참가자 10명이 전부 저장돼 있어도
+        여기 반환되는 행은 항상 이 player_id 한 명 것뿐임.
         """
-        clause, params = self._cutoff_clause("m")
+        cutoff_clause, cutoff_params = self._cutoff_clause("m")
+        queue_clause, queue_params = self._queue_in_clause(queue_ids)
 
         query = f"""
             SELECT
@@ -62,16 +75,26 @@ class ScoutingRepo:
             FROM player_matches pm
             JOIN matches m ON m.match_id = pm.match_id
             WHERE pm.player_id = ?
-              AND m.queue_id = ?
+              AND {queue_clause}
               AND pm.canonical_role = ?
-              {clause}
+              {cutoff_clause}
             ORDER BY m.game_start ASC
         """
 
-        return self._conn.execute(query, (player_id, queue_id, role, *params)).fetchall()
+        params = (player_id, *queue_params, role, *cutoff_params)
+        return self._conn.execute(query, params).fetchall()
 
-    def get_all_matches(self, player_id: int, queue_id: int = 420) -> list[sqlite3.Row]:
-        clause, params = self._cutoff_clause("m")
+    def get_all_matches(
+        self,
+        player_id: int,
+        queue_ids: tuple[int, ...] | list[int] = (420,),
+    ) -> list[sqlite3.Row]:
+        """
+        pm.player_id로 걸러내므로, 매치당 참가자 10명이 전부 저장돼 있어도
+        여기 반환되는 행은 항상 이 player_id 한 명 것뿐임.
+        """
+        cutoff_clause, cutoff_params = self._cutoff_clause("m")
+        queue_clause, queue_params = self._queue_in_clause(queue_ids)
 
         query = f"""
             SELECT
@@ -82,12 +105,13 @@ class ScoutingRepo:
             FROM player_matches pm
             JOIN matches m ON m.match_id = pm.match_id
             WHERE pm.player_id = ?
-              AND m.queue_id = ?
-              {clause}
+              AND {queue_clause}
+              {cutoff_clause}
             ORDER BY m.game_start ASC
         """
 
-        return self._conn.execute(query, (player_id, queue_id, *params)).fetchall()
+        params = (player_id, *queue_params, *cutoff_params)
+        return self._conn.execute(query, params).fetchall()
 
     def get_fetch_state(self, player_id: int, queue_id: int = 420) -> sqlite3.Row | None:
         return db.get_fetch_state(self._conn, player_id, queue_id)

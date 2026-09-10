@@ -100,14 +100,15 @@ def compute_player_thickness(
     repo: ScoutingRepo,
     player_id: int,
     role: str,
-    queue_id: int = 420,
+    queue_ids: tuple[int, ...] | list[int] = (420,),
     as_of_ms: int | None = None,
 ) -> dict:
     """
     한 선수/한 포지션에 대한 데이터 두께 지표를 계산함.
-    rows는 repo가 이미 cutoff_time 이하로만, game_start 오름차순으로 준 것.
+    rows는 repo가 이미 cutoff_time 이하로만, game_start 오름차순으로 준 것이고
+    player_id로 걸러져 있어서 같은 매치의 다른 9명 참가자는 절대 섞이지 않음.
     """
-    rows = repo.get_role_matches(player_id, role, queue_id=queue_id)
+    rows = repo.get_role_matches(player_id, role, queue_ids=queue_ids)
 
     role_game_count = len(rows)
 
@@ -143,6 +144,14 @@ def compute_player_thickness(
         for window in NOVEL_PICK_WINDOWS
     }
 
+    earliest_match_ms = rows[0]["game_start"] if rows else None
+    latest_match_ms = rows[-1]["game_start"] if rows else None
+    span_days = (
+        (latest_match_ms - earliest_match_ms) / (24 * 60 * 60 * 1000)
+        if rows
+        else None
+    )
+
     return {
         "player_id": player_id,
         "role": role,
@@ -156,6 +165,9 @@ def compute_player_thickness(
         "latest_patch": latest_patch,
         "pct_on_latest_patch": pct_on_latest_patch,
         "novel_pick_rate": novel_pick_rate,
+        "earliest_match_ms": earliest_match_ms,
+        "latest_match_ms": latest_match_ms,
+        "span_days": span_days,
     }
 
 

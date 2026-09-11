@@ -9,14 +9,14 @@ import random
 import time
 from pathlib import Path
 
-import champion_data
-import champion_emoji
-from gtts_session import close_gtts_session
+from riot import champion_data
+from riot import champion_emoji
+from tts.gtts_session import close_gtts_session
 from http_session import close_session
-from tts_queue import add_tts_queue, add_bot_tts_queue
+from tts.tts_queue import add_tts_queue, add_bot_tts_queue
 from discord_commands import setup_commands
-from clash_commands import setup_clash_commands
-from ban_commands import setup_ban_commands
+from clash.clash_commands import setup_clash_commands
+from scouting.ban_commands import setup_ban_commands
 
 
 # =========================

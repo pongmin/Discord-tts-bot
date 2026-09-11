@@ -1,10 +1,10 @@
 import discord
 from discord import app_commands
 import random
-from tts_queue import clear_guild_queue
-from tts_settings import USER_TTS_SETTINGS, save_user_tts_settings
+from tts.tts_queue import clear_guild_queue
+from tts.tts_settings import USER_TTS_SETTINGS, save_user_tts_settings
 
-from champion_recommend import (
+from riot.champion_recommend import (
     pick_random_champion,
     get_champion_image_url,
     LANE_DISPLAY,

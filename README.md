@@ -19,6 +19,23 @@ GUILD_IDS = [
     123456789012345678,  # 여기에 본인 서버 ID 추가
 ]
 
+폴더 구조
+
+```text
+main.py                 봇 진입점 (여기서 실행)
+discord_commands.py     일반 슬래시 커맨드
+http_session.py         공용 aiohttp 세션
+tts/                    TTS 음성 생성·큐·유저 설정 (tts_text/ 전처리 포함)
+riot/                   Riot API 클라이언트, Data Dragon 캐시, 챔피언 이모지·추천
+scouting/               밴 추천 알고리즘·리포트, 매치/스냅샷 수집, scouting.db 접근
+clash/                  클래시 조회 커맨드
+tests/                  네트워크 없는 테스트 전체
+data/                   런타임 캐시·DB (git 추적 안 함, 항상 루트에 위치)
+```
+
+CLI 스크립트는 패키지 안에 있으므로 루트에서 모듈로 실행합니다
+(예: `python -m scouting.collect_matches "이름#태그"`).
+
 밴 추천 v1 수동 확인:
 
 Discord에서는 봇을 재시작해 기존 길드 커맨드 동기화가 완료되면 아래처럼 사용합니다.
@@ -80,7 +97,7 @@ TOP → JUNGLE → MID → BOTTOM → SUPPORT → 종합 밴 추천 순서로 �
 champion_id로 조회해 한글로 표시하며, 봇 시작 시(`on_ready`) 한 번 자동으로
 캐시를 받아둡니다. 캐시가 아직 없거나 그 버전에 없는 챔피언은 DB에 저장된
 Riot 내부 영문 이름으로 조용히 대체되므로(리포트 자체는 실패하지 않음),
-최신 챔피언을 바로 한글로 보고 싶으면 `python champion_data.py --force`로
+최신 챔피언을 바로 한글로 보고 싶으면 `python -m riot.champion_data --force`로
 캐시를 갱신하세요.
 
 각 챔피언 이름 앞에는 스퀘어 아이콘이 인라인 이모지로 붙습니다
@@ -111,15 +128,15 @@ job은 사라지지만, 이미 커밋된 경기 데이터는 남아 있어 다�
 커맨드·화면·캐시 메타데이터의 네트워크 없는 테스트:
 
 ```powershell
-python -m unittest discover -v
+python -m unittest discover -s tests -t . -v
 ```
 
 로컬 수동 실행:
 
 ```powershell
-python test_ban_algorithm.py
+python -m tests.test_ban_algorithm
 # 다른 수집 DB를 사용할 경우:
-python test_ban_algorithm.py --db path/to/scouting.db
+python -m tests.test_ban_algorithm --db path/to/scouting.db
 ```
 
 실제 `Pongmin#3369`의 BOTTOM 기록과 합성 선수 4명으로 추천 및 진단을
@@ -152,9 +169,9 @@ Pongmin의 픽 확률·Threat·주 챔피언 밴 전후 잔여 위협은 출력�
 기존 승률 지수에 `0.4 * log(max(KDA_adj, 1e-6) / max(KDA_baseline, 1e-6))`을
 더합니다. 1경기 표본도 포함하며 기준에는 해당 챔피언의 기록도 포함됩니다.
 기존 nullable 경기 자료의 누락된 K/D/A 수치는 0으로 처리합니다.
-`python test_ban_algorithm.py`에서 Pongmin의 챔피언별 KDA와 위험도 변경 전후를
+`python -m tests.test_ban_algorithm`에서 Pongmin의 챔피언별 KDA와 위험도 변경 전후를
 비교할 수 있습니다. 수치 경계 사례를 포함한 전체 테스트는
-`python -m unittest discover -v`로 실행합니다.
+`python -m unittest discover -s tests -t . -v`로 실행합니다.
 
 `Others`는 위험도 `1.0`인 중립 사전값이며, 밴 후보나 추천 목록에는 들어가지
 않습니다. 밴 후 비례 재분배에는 항상 남는 선택지로 포함됩니다.
@@ -191,7 +208,7 @@ marginal contribution은 전부 이 새 `r`을 그대로 쓰므로 최적 밴 �
 `P_personal` 기준 - 이유는 위와 동일). 선수 상세 페이지에는 챔피언별
 숫자 표시를 추가하지 않았고, 기존 주력 집중도(Top1/Top3)를 그대로 씁니다.
 
-Dependency 전용 테스트: `python -m unittest test_ban_dependency -v`
+Dependency 전용 테스트: `python -m unittest tests.test_ban_dependency -v`
 (성과·Threat와 독립적인 페널티 검증, Others 제외, 탐색/marginal 반영,
 극단값에서 NaN/inf 없음, 그리고 실제와 비슷한 수치로 재구성한 샤밀하#KR1/
 BOTTOM 시나리오 - 모스트1 미스 포츈이 Dependency 도입 전에는 추천 3밴에

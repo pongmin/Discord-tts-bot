@@ -15,12 +15,15 @@ from discord.ext import commands
 
 from scouting import ban_commands as command
 from clash.clash_commands import setup_clash_commands
-from riot.riot_api import RiotAccount, PlayerNotFoundError
+from riot.riot_api import ClashPlayer, NotInClashError, RiotAccount, PlayerNotFoundError
 from scouting import scouting_db as db
 from scouting.scouting_job_manager import ScoutingJobManager
 
 
-class BanCommandTests(unittest.IsolatedAsyncioTestCase):
+class ScoutingCommandFixture(unittest.IsolatedAsyncioTestCase):
+    """Shared offline fixture: in-memory scouting.db, stubbed Riot calls, and
+    a per-test job manager (the real one is a process-wide singleton)."""
+
     async def asyncSetUp(self):
         self.uri = f"file:{uuid4().hex}?mode=memory&cache=shared"
         self.anchor = self.connection()
@@ -80,6 +83,32 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         db.refresh_fetch_state(conn, player_id, queue_id, True)
         return dict(player_id=player_id, failed=0, aborted=False, is_complete=True)
 
+    def _bot_with_ban_commands(self):
+        bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+        self.addAsyncCleanup(bot.close)
+        setup_clash_commands(bot)
+        clash = bot.tree.get_command("clashlookup")
+        command.setup_ban_commands(bot)
+        self.assertIs(bot.tree.get_command("clashlookup"), clash)
+        return bot.tree.get_command("banrecommend")
+
+    _next_message_id = itertools.count(10_000_000)
+
+    @classmethod
+    def _interaction(cls, user_id: int = 123, guild_id: int = 555):
+        channel = SimpleNamespace(id=999, send=AsyncMock())
+        # channel.send must return something with a real int .id: the
+        # persistent-report code path stores it as a SQLite PK
+        # (scouting_db.save_ban_report), which a bare MagicMock id can't bind.
+        channel.send.side_effect = lambda *a, **kw: SimpleNamespace(id=next(cls._next_message_id))
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=user_id), guild_id=guild_id, channel=channel,
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+        return interaction, channel
+
+
+class BanCommandTests(ScoutingCommandFixture):
     async def test_success_roles_cache_and_real_algorithm(self):
         before = hashlib.sha256(Path("scouting/ban_algorithm.py").read_bytes()).digest()
         opponents = await command.prepare_opponents(self.inputs, self.progress)
@@ -149,30 +178,6 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         state = self.anchor.execute("SELECT * FROM player_fetch_state WHERE player_id=1 AND queue_id=420").fetchone()
         self.assertFalse(state["is_complete"])
         self.assertGreater(state["last_attempt_at"], 0)
-
-    def _bot_with_ban_commands(self):
-        bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
-        self.addAsyncCleanup(bot.close)
-        setup_clash_commands(bot)
-        clash = bot.tree.get_command("clashlookup")
-        command.setup_ban_commands(bot)
-        self.assertIs(bot.tree.get_command("clashlookup"), clash)
-        return bot.tree.get_command("banrecommend")
-
-    _next_message_id = itertools.count(10_000_000)
-
-    @classmethod
-    def _interaction(cls, user_id: int = 123, guild_id: int = 555):
-        channel = SimpleNamespace(id=999, send=AsyncMock())
-        # channel.send must return something with a real int .id: the
-        # persistent-report code path stores it as a SQLite PK
-        # (scouting_db.save_ban_report), which a bare MagicMock id can't bind.
-        channel.send.side_effect = lambda *a, **kw: SimpleNamespace(id=next(cls._next_message_id))
-        interaction = SimpleNamespace(
-            user=SimpleNamespace(id=user_id), guild_id=guild_id, channel=channel,
-            response=SimpleNamespace(send_message=AsyncMock()),
-        )
-        return interaction, channel
 
     async def test_command_registration_shape(self):
         slash = self._bot_with_ban_commands()
@@ -457,6 +462,102 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         interaction.response.send_message.assert_awaited_once()
         self.assertIn("다시 실행", interaction.response.send_message.call_args.args[0])
         interaction.response.defer.assert_not_awaited()
+
+
+class ClashBanCommandTests(ScoutingCommandFixture):
+    """/clashban resolves the roster, then hands the unchanged /banrecommend
+    pipeline exactly the five role inputs it already takes."""
+
+    POSITIONS = ("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY")
+
+    def roster(self, positions=POSITIONS, count=5):
+        """(ClashPlayer, RiotAccount) pairs matching self.inputs' accounts."""
+        return [
+            (ClashPlayer(puuid=f"Player{index}", position=positions[index]),
+             RiotAccount(f"Player{index}", f"Player{index}", "TEST"))
+            for index in range(count)
+        ]
+
+    def _clashban_command(self):
+        bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+        self.addAsyncCleanup(bot.close)
+        setup_clash_commands(bot)
+        command.setup_ban_commands(bot)
+        return bot.tree.get_command("clashban")
+
+    @staticmethod
+    def _clash_interaction(user_id: int = 123):
+        channel = SimpleNamespace(id=999, send=AsyncMock())
+        channel.send.side_effect = lambda *a, **kw: SimpleNamespace(id=next(ScoutingCommandFixture._next_message_id))
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=user_id), guild_id=555, channel=channel,
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        return interaction, channel
+
+    async def test_registration_takes_one_riot_id_and_the_same_depth_choices(self):
+        slash = self._clashban_command()
+        self.assertEqual([p.name for p in slash.parameters], ["riot_id", "depth"])
+        self.assertTrue(slash.parameters[0].required)
+        depth_param = slash.parameters[1]
+        self.assertFalse(depth_param.required)
+        self.assertEqual(depth_param.default, "normal")
+        self.assertEqual([c.value for c in depth_param.choices], ["quick", "normal", "deep"])
+
+    async def test_roster_becomes_the_banrecommend_job_and_report(self):
+        slash = self._clashban_command()
+        interaction, channel = self._clash_interaction()
+        with patch.object(command, "fetch_clash_roster", AsyncMock(return_value=self.roster())):
+            await slash.callback(interaction, "Player0#TEST")
+
+        # The team key is the one /banrecommend would have produced, so the
+        # two commands share a single in-flight collection per team.
+        job = self.jobs.get(command._team_key(command.parse_inputs(self.inputs)))
+        self.assertIsNotNone(job)
+        self.assertEqual(job.kind, "clashban")
+        await job.task
+
+        self.assertEqual(job.status.value, "completed")
+        self.assertEqual(self.collect.await_count, 10)
+        channel.send.assert_awaited_once()
+        view = channel.send.call_args.kwargs["view"]
+        self.addCleanup(view.stop)
+        self.assertIn("TOP", channel.send.call_args.kwargs["embed"].title)
+        self.assertIsNotNone(db.get_ban_report(self.anchor, view.message.id))
+
+    async def test_roster_problems_stop_in_korean_without_starting_a_job(self):
+        cases = (
+            (self.roster(count=4), "5명"),
+            (self.roster(positions=("TOP", "TOP", "MIDDLE", "BOTTOM", "UTILITY")), "중복"),
+            (self.roster(positions=("TOP", "FILL", "MIDDLE", "BOTTOM", "UTILITY")), "포지션이 정해지지 않은"),
+            ([(ClashPlayer(puuid="p", position="TOP"), PlayerNotFoundError("계정 없음"))], "5명"),
+            (NotInClashError("클래시에 등록되지 않은 플레이어입니다."), "클래시에 등록되지 않은"),
+        )
+        for roster, expected in cases:
+            with self.subTest(expected=expected):
+                slash = self._clashban_command()
+                interaction, channel = self._clash_interaction()
+                lookup = AsyncMock(side_effect=roster) if isinstance(roster, Exception)                     else AsyncMock(return_value=roster)
+                with patch.object(command, "fetch_clash_roster", lookup):
+                    await slash.callback(interaction, "Player0#TEST")
+                interaction.followup.send.assert_awaited_once()
+                self.assertIn(expected, interaction.followup.send.call_args.args[0])
+                self.assertEqual(len(self.jobs._jobs), 0)
+                self.collect.assert_not_awaited()
+                channel.send.assert_not_awaited()
+
+    async def test_unresolved_roster_account_stops_instead_of_analyzing_unknown(self):
+        roster = self.roster()
+        roster[3] = (roster[3][0], PlayerNotFoundError("계정 없음"))
+        slash = self._clashban_command()
+        interaction, _ = self._clash_interaction()
+        with patch.object(command, "fetch_clash_roster", AsyncMock(return_value=roster)):
+            await slash.callback(interaction, "Player0#TEST")
+        message = interaction.followup.send.call_args.args[0]
+        self.assertIn("BOTTOM", message)
+        self.assertIn("Riot ID를 확인하지 못했습니다", message)
+        self.assertEqual(len(self.jobs._jobs), 0)
 
 
 if __name__ == "__main__":

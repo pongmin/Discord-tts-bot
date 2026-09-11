@@ -36,6 +36,37 @@ def _position_sort_key(player) -> int:
         return len(POSITION_ORDER)
 
 
+async def fetch_clash_roster(riot_id: str):
+    """Riot ID 한 명 -> 그 사람이 속한 격전 팀 로스터.
+
+    (ClashPlayer, RiotAccount | Exception) 쌍을 포지션 순으로 정렬해 돌려줌.
+    계정 조회가 실패한 팀원은 예외 객체 그대로 넘겨서, 호출 쪽이 "알 수 없음"
+    으로 표시할지(/clashlookup) 중단할지(/clashban) 스스로 정하게 함.
+
+    "이름#MOCK" 태그라인이면 실제 Riot API 대신 mock_clash_data로 라우팅하는
+    기존 동작을 그대로 유지함 - 이후 경로는 실제 팀 조회와 완전히 동일하다.
+    """
+    game_name, tag_line = parse_riot_id(riot_id)
+
+    if is_mock_tag_line(tag_line):
+        team_id = await mock_get_team_id(game_name)
+        players = await mock_get_team(team_id)
+        resolve_account = mock_get_account_by_puuid
+    else:
+        account = await get_account_by_riot_id(game_name, tag_line)
+        team_id = await get_clash_team_id(account.puuid)
+        players = await get_clash_team(team_id)
+        resolve_account = get_account_by_puuid
+
+    # puuid -> 현재 Riot ID 는 병렬로 조회
+    resolved_accounts = await asyncio.gather(
+        *(resolve_account(player.puuid) for player in players),
+        return_exceptions=True
+    )
+
+    return sorted(zip(players, resolved_accounts), key=lambda pair: _position_sort_key(pair[0]))
+
+
 def setup_clash_commands(bot):
 
     @bot.tree.command(
@@ -47,30 +78,7 @@ def setup_clash_commands(bot):
         await interaction.response.defer()
 
         try:
-            game_name, tag_line = parse_riot_id(riot_id)
-
-            # "이름#MOCK" 태그라인이면 실제 Riot API 대신 mock_clash_data로 라우팅.
-            # 이후 정렬/조회/임베드 생성 로직은 실제 팀 조회와 완전히 동일한 경로를 탄다.
-            if is_mock_tag_line(tag_line):
-                team_id = await mock_get_team_id(game_name)
-                players = await mock_get_team(team_id)
-                resolve_account = mock_get_account_by_puuid
-            else:
-                account = await get_account_by_riot_id(game_name, tag_line)
-                team_id = await get_clash_team_id(account.puuid)
-                players = await get_clash_team(team_id)
-                resolve_account = get_account_by_puuid
-
-            # puuid -> 현재 Riot ID 는 병렬로 조회
-            resolved_accounts = await asyncio.gather(
-                *(resolve_account(player.puuid) for player in players),
-                return_exceptions=True
-            )
-
-            rows = sorted(
-                zip(players, resolved_accounts),
-                key=lambda pair: _position_sort_key(pair[0])
-            )
+            rows = await fetch_clash_roster(riot_id)
 
             lines = []
             for player, resolved in rows:

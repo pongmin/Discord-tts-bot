@@ -16,6 +16,7 @@ import logging
 import discord
 from discord import app_commands
 
+from clash.clash_commands import fetch_clash_roster
 from scouting.ban_algorithm import Recommendation, recommend_bans, format_recommendation
 from scouting.ban_report_assets import load_player_presentations
 from scouting.ban_report_ui import ScoutingReportView
@@ -32,6 +33,12 @@ from scouting.scouting_repo import ScoutingRepo
 logger = logging.getLogger(__name__)
 ROLE_INPUTS = ("top", "jungle", "middle", "bottom", "utility")
 ROLE_LABELS = {"top": "TOP", "jungle": "JUNGLE", "middle": "MID", "bottom": "BOTTOM", "utility": "SUPPORT"}
+# CLASH-V1 position -> this module's role input key. Anything else (UNSELECTED,
+# FILL, an unknown value) has no role to analyze and stops /clashban.
+CLASH_POSITION_ROLES = {
+    "TOP": "top", "JUNGLE": "jungle", "MIDDLE": "middle",
+    "BOTTOM": "bottom", "UTILITY": "utility",
+}
 QUEUE_IDS = (420, 400)
 QUEUE_LABELS = {420: "솔로 랭크", 400: "일반 드래프트"}
 # Placeholder collection budgets, not tuned. Estimates are per cold-cache player:
@@ -68,6 +75,44 @@ def parse_inputs(inputs: dict[str, str]) -> list[tuple[str, str, str]]:
         seen[key] = role
         parsed.append((role, game_name, tag_line))
     return parsed
+
+
+async def resolve_clash_inputs(riot_id: str) -> dict[str, str]:
+    """One opponent's Riot ID -> the /banrecommend inputs for their Clash team.
+
+    Reuses /clashlookup's roster lookup as-is (including its "#MOCK" routing)
+    and only maps it onto the five role slots; collection, scoring and the
+    report are the unchanged /banrecommend pipeline. Anything that cannot be
+    mapped to exactly one player per role stops here with a Korean error
+    rather than analyzing a partial team.
+    """
+    roster = await fetch_clash_roster(riot_id)
+    if len(roster) != 5:
+        raise BanCommandError(
+            f"격전 팀 인원이 {len(roster)}명입니다. 5명이 모두 등록된 팀만 분석할 수 있습니다."
+        )
+    inputs: dict[str, str] = {}
+    for player, resolved in roster:
+        position = (player.position or "").upper()
+        role = CLASH_POSITION_ROLES.get(position)
+        if role is None:
+            raise BanCommandError(
+                "포지션이 정해지지 않은 팀원이 있습니다. 격전 팀에서 5개 포지션이 "
+                "모두 지정된 뒤 다시 시도해주세요."
+            )
+        if role in inputs:
+            raise BanCommandError(
+                f"{ROLE_LABELS[role]} 포지션이 중복된 팀입니다. 격전 팀 포지션을 확인해주세요."
+            )
+        if isinstance(resolved, Exception):
+            # /clashlookup shows these as "알 수 없음"; a recommendation cannot
+            # collect for an account it could not resolve, so stop instead.
+            raise BanCommandError(
+                f"{ROLE_LABELS[role]} 팀원의 Riot ID를 확인하지 못했습니다. 잠시 후 다시 시도해주세요."
+            )
+        inputs[role] = f"{resolved.game_name}#{resolved.tag_line}"
+    # Five members, five distinct mapped roles: every slot is filled.
+    return inputs
 
 
 def _fresh(timestamp: int | None, now: int, ttl: int) -> bool:
@@ -411,6 +456,12 @@ def setup_ban_commands(bot):
     # 로그인 전에 호출해도 되는 동기 등록이라 setup 시점에 바로 둠.
     bot.add_view(PersistentBanReportRouter())
 
+    depth_choices = [
+        app_commands.Choice(name="빠르게 · 30경기", value="quick"),
+        app_commands.Choice(name="기본 · 100경기", value="normal"),
+        app_commands.Choice(name="깊게 · 200경기", value="deep"),
+    ]
+
     @bot.tree.command(name="banrecommend", description="상대 5명의 역할별 Riot ID로 밴 3개를 추천합니다.")
     @app_commands.describe(
         top="TOP 선수 (이름#태그)", jungle="JUNGLE 선수 (이름#태그)",
@@ -418,11 +469,7 @@ def setup_ban_commands(bot):
         utility="SUPPORT 선수 (이름#태그)",
         depth="수집 깊이: 빠르게 30 / 기본 100 / 깊게 200 경기, 선수·큐별",
     )
-    @app_commands.choices(depth=[
-        app_commands.Choice(name="빠르게 · 30경기", value="quick"),
-        app_commands.Choice(name="기본 · 100경기", value="normal"),
-        app_commands.Choice(name="깊게 · 200경기", value="deep"),
-    ])
+    @app_commands.choices(depth=depth_choices)
     async def banrecommend(
         interaction: discord.Interaction, top: str, jungle: str,
         middle: str, bottom: str, utility: str,
@@ -465,4 +512,65 @@ def setup_ban_commands(bot):
 
         await interaction.response.send_message(
             "🔎 밴 추천 분석을 시작했습니다. 완료되면 이 채널에 결과를 보내드릴게요."
+        )
+
+    @bot.tree.command(
+        name="clashban",
+        description="상대 한 명의 Riot ID로 격전 팀을 찾아 밴 3개를 추천합니다.",
+    )
+    @app_commands.describe(
+        riot_id="상대 팀원 한 명 (이름#태그)",
+        depth="수집 깊이: 빠르게 30 / 기본 100 / 깊게 200 경기, 선수·큐별",
+    )
+    @app_commands.choices(depth=depth_choices)
+    async def clashban(interaction: discord.Interaction, riot_id: str, depth: str = "normal"):
+        """/banrecommend와 같은 파이프라인을, 역할별 Riot ID 5개 대신 격전 팀
+        조회로 채워 실행함. 밴 로직·수집·리포트는 전부 기존 것을 그대로 씀.
+
+        로스터 조회만 커맨드 안에서(백그라운드 job 전에) 처리함 - 그래야 팀을
+        못 찾거나 로스터가 5명/5포지션이 아닐 때 job을 만들지 않고 바로 알려줄
+        수 있고, 확정된 5명으로 만든 dedupe key가 /banrecommend의 것과 정확히
+        같아져서 같은 팀을 두 커맨드로 동시에 분석하는 일도 막힘.
+        """
+        if depth not in DEPTH_CAPS:
+            await interaction.response.send_message(
+                "❌ 수집 깊이는 빠르게, 기본, 깊게 중에서 선택해주세요.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        try:
+            inputs = await resolve_clash_inputs(riot_id)
+            parsed = parse_inputs(inputs)
+        except (BanCommandError, RiotApiError) as exc:
+            await interaction.followup.send(f"❌ {exc}"[:1900])
+            return
+        except Exception:
+            logger.exception("CLASHBAN roster lookup failed for %r", riot_id)
+            await interaction.followup.send("❌ 격전 팀 정보를 불러오지 못했습니다. 봇 로그를 확인해주세요.")
+            return
+
+        channel = interaction.channel
+
+        async def runner(job: ScoutingJob) -> None:
+            await _run_banrecommend_job(job, inputs, depth, channel, interaction.user.id, interaction.guild_id)
+
+        # Same key shape as /banrecommend: one in-flight collection per team,
+        # whichever command asked for it.
+        job, created = scouting_jobs.start(
+            key=_team_key(parsed), kind="clashban", user_id=interaction.user.id,
+            guild_id=interaction.guild_id, channel_id=channel.id,
+            players=tuple(parsed), runner=runner,
+        )
+
+        if not created:
+            await interaction.followup.send("이미 같은 팀을 분석 중입니다.")
+            return
+
+        roster = " · ".join(f"{ROLE_LABELS[role]} {inputs[role]}" for role in ROLE_INPUTS)
+        await interaction.followup.send(
+            (f"🔎 격전 팀을 찾았습니다 ({roster}).\n"
+             "밴 추천 분석을 시작했습니다. 완료되면 이 채널에 결과를 보내드릴게요.")[:1900],
+            allowed_mentions=discord.AllowedMentions.none(),
         )

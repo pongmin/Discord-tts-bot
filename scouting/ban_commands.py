@@ -19,7 +19,7 @@ from discord import app_commands
 from clash.clash_commands import fetch_clash_roster
 from scouting.ban_algorithm import Recommendation, recommend_bans, format_recommendation
 from scouting.ban_report_assets import load_player_presentations
-from scouting.ban_report_ui import ScoutingReportView
+from scouting.ban_report_ui import LAST_PAGE_INDEX, ScoutingReportView
 from scouting.match_collector import collect_player_matches
 from riot.riot_api import (
     parse_riot_id, get_account_by_riot_id, get_league_entries,
@@ -141,6 +141,12 @@ async def _ensure_solo_rank(conn, player_id: int, account) -> None:
 async def prepare_opponents(
     inputs: dict[str, str], progress, depth: str = "normal",
 ) -> list[tuple[int, str]]:
+    """Resolve, collect and rank all five opponents.
+
+    `progress(message, role=..., done=...)` reports both the stage text (used
+    verbatim in failure messages) and, where a stage belongs to one player,
+    which role it is and whether that player is now fully collected.
+    """
     if depth not in DEPTH_CAPS:
         raise BanCommandError("수집 깊이는 빠르게, 기본, 깊게 중에서 선택해주세요.")
     cap = DEPTH_CAPS[depth]
@@ -150,7 +156,7 @@ async def prepare_opponents(
     # Resolve all five before writing/collecting; aliases can map to one PUUID.
     for role, game_name, tag_line in parsed:
         label = f"{game_name}#{tag_line}"
-        await progress(f"{ROLE_LABELS[role]} 계정 조회 ({label})")
+        await progress(f"{ROLE_LABELS[role]} 계정 조회 ({label})", role=role)
         account = await get_account_by_riot_id(game_name, tag_line)
         if account.puuid in seen_puuids:
             raise BanCommandError(
@@ -168,7 +174,9 @@ async def prepare_opponents(
                 conn, account.puuid, account.game_name, account.tag_line
             )
             for queue_id in QUEUE_IDS:
-                await progress(f"{ROLE_LABELS[role]} {QUEUE_LABELS[queue_id]} 경기 확보 ({label})")
+                await progress(
+                    f"{ROLE_LABELS[role]} {QUEUE_LABELS[queue_id]} 경기 확보 ({label})", role=role
+                )
                 # Count actual player/queue rows at cutoff, regardless of role
                 # or fetch-state age. Never limit the algorithm's read-side pool.
                 with ScoutingRepo(cutoff_time=collection_cutoff, conn=conn) as repo:
@@ -189,7 +197,7 @@ async def prepare_opponents(
                     )
                 if result["player_id"] != player_id:
                     raise BanCommandError(f"{ROLE_LABELS[role]} 수집 계정 불일치 ({label}). 추천을 중단합니다.")
-            await progress(f"{ROLE_LABELS[role]} 솔로 랭크 확보 ({label})")
+            await progress(f"{ROLE_LABELS[role]} 솔로 랭크 확보 ({label})", role=role)
             await _ensure_solo_rank(conn, player_id, account)
             with ScoutingRepo(cutoff_time=db.now_ms(), conn=conn) as repo:
                 if not repo.get_role_matches(player_id, role.upper(), queue_ids=QUEUE_IDS):
@@ -197,6 +205,9 @@ async def prepare_opponents(
                         f"{ROLE_LABELS[role]} 데이터 부족 ({label}): 수집된 솔로 랭크·일반 드래프트에 "
                         f"{ROLE_LABELS[role]} 기록이 없어 추천을 중단합니다."
                     )
+            # Only now is this player fully collected: account, both queues'
+            # matches, rank, and a non-empty role history.
+            await progress(f"{ROLE_LABELS[role]} 수집 완료 ({label})", role=role, done=True)
             opponents.append((player_id, role.upper()))
     return opponents
 
@@ -293,6 +304,102 @@ def _team_key(parsed: list[tuple[str, str, str]]) -> tuple:
     return tuple((role, game_name.casefold(), tag_line.casefold()) for role, game_name, tag_line in parsed)
 
 
+class BanProgressStatus:
+    """Per-player collection progress in one bot-owned channel message.
+
+    Lives on a plain channel message the job sends itself, not on the
+    interaction reply: the job outlives the interaction token, and both
+    /banrecommend and /clashban run through the same job body, so both get
+    this for free.
+
+    Every Discord call here is best-effort - a failed send or edit is logged
+    and swallowed, never allowed to fail the analysis it is reporting on. If
+    the initial send fails there is no message to edit and every later update
+    is skipped silently.
+    """
+
+    def __init__(self, channel, inputs: dict[str, str]):
+        self.channel = channel
+        self.inputs = inputs
+        self.done: set[str] = set()
+        self.current: str | None = None
+        self.footer = f"0 / {len(ROLE_INPUTS)} 완료"
+        self.message = None
+        self.rendered = None
+
+    def render(self) -> str:
+        lines = ["🔎 밴 추천 분석 중", ""]
+        for role in ROLE_INPUTS:
+            if role in self.done:
+                mark = "✅"
+            elif role == self.current:
+                mark = "⏳"
+            else:
+                mark = "⬜"
+            lines.append(f"{mark} {ROLE_LABELS[role]} — {self.inputs[role]}")
+        lines.extend(["", self.footer])
+        return "\n".join(lines)[:1900]
+
+    async def start(self) -> None:
+        self.rendered = self.render()
+        try:
+            self.message = await self.channel.send(
+                self.rendered, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except Exception:
+            logger.warning("Ban progress status message could not be sent", exc_info=True)
+
+    async def _refresh(self) -> None:
+        content = self.render()
+        # Several collection stages per player render identically (both queues
+        # while that player is the ⏳ one); skipping those keeps this well
+        # clear of Discord's per-message edit rate limit.
+        if self.message is None or content == self.rendered:
+            return
+        self.rendered = content
+        try:
+            await self.message.edit(
+                content=content, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except Exception:
+            logger.warning("Ban progress status message could not be edited", exc_info=True)
+
+    async def set_current(self, role: str) -> None:
+        """Mark `role` as the player being worked on right now."""
+        if role in self.done:
+            return
+        self.current = role
+        await self._refresh()
+
+    async def mark_done(self, role: str) -> None:
+        """Mark `role` finished - account, matches and rank all collected."""
+        self.done.add(role)
+        if self.current == role:
+            self.current = None
+        self.footer = f"{len(self.done)} / {len(ROLE_INPUTS)} 완료"
+        await self._refresh()
+
+    async def start_calculation(self) -> None:
+        self.current = None
+        self.footer = f"✅ {len(self.done)} / {len(ROLE_INPUTS)} 수집 완료 · 밴 계산 중..."
+        await self._refresh()
+
+    async def complete(self) -> None:
+        self.current = None
+        self.footer = f"✅ {len(self.done)} / {len(ROLE_INPUTS)} 수집 완료 · 분석 완료"
+        await self._refresh()
+
+    async def fail(self, stage: str) -> None:
+        """Leave the message on the stage that stopped it, not a stale ⏳.
+
+        The actionable error text is still its own message; this only keeps
+        the status message from looking like it is still running forever.
+        """
+        self.current = None
+        self.footer = f"❌ {stage}에서 중단됨"
+        await self._refresh()
+
+
 async def _run_banrecommend_job(
     job: ScoutingJob, inputs: dict[str, str], depth: str, channel, owner_id: int,
     guild_id: int | None,
@@ -306,9 +413,19 @@ async def _run_banrecommend_job(
     ScoutingJobManager also records the failure on the job itself.
     """
     mentions = discord.AllowedMentions.none()
+    status = BanProgressStatus(channel, inputs)
+    await status.start()
 
-    async def progress(message: str):
+    async def progress(message: str, role: str | None = None, done: bool = False):
+        # job.stage stays the source of truth for failure messages; the status
+        # message is a purely cosmetic, best-effort mirror of per-player state.
         job.set_stage(message)
+        if role is None:
+            return
+        if done:
+            await status.mark_done(role)
+        else:
+            await status.set_current(role)
 
     try:
         async with asyncio.timeout(COMMAND_TIMEOUT_SECONDS):
@@ -325,6 +442,7 @@ async def _run_banrecommend_job(
             async with scouting_db_lock:
                 opponents = await prepare_opponents(inputs, progress, depth)
                 await progress("밴 계산 중")
+                await status.start_calculation()
                 # Captured AFTER collection finishes, not before: a freshly
                 # collected match's game_end can land at/after a cutoff taken
                 # earlier, which would make build_player_model see "no games
@@ -332,6 +450,7 @@ async def _run_banrecommend_job(
                 cutoff_time = db.now_ms()
                 result, presentations = await asyncio.to_thread(_build_discord_report, opponents, cutoff_time)
     except TimeoutError:
+        await status.fail(job.stage)
         await channel.send(
             "❌ 처리 시간이 초과되어 추천을 중단했습니다. "
             "저장된 경기는 유지됩니다. 다시 실행하면 캐시를 재사용합니다.",
@@ -339,12 +458,14 @@ async def _run_banrecommend_job(
         )
         raise
     except (BanCommandError, RiotApiError, ValueError) as exc:
+        await status.fail(job.stage)
         await channel.send(f"❌ {job.stage}: {_error_text(exc)}"[:1900], allowed_mentions=mentions)
         raise
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.exception("BANRECOMMEND background job failed at %s", job.stage)
+        await status.fail(job.stage)
         await channel.send(
             f"❌ {job.stage}: 오류가 발생해 추천을 중단했습니다. 봇 로그를 확인해주세요.",
             allowed_mentions=mentions,
@@ -352,6 +473,7 @@ async def _run_banrecommend_job(
         raise
 
     await progress("완료")
+    await status.complete()
     view = ScoutingReportView(result, presentations, owner_id=owner_id, on_page_change=_persist_page_index)
     view.message = await channel.send(embed=view.current_embed, view=view, allowed_mentions=mentions)
 
@@ -408,7 +530,7 @@ class PersistentBanReportRouter(discord.ui.View):
 
         await interaction.response.defer()
         opponents = db.ban_report_opponents(row)
-        target_page = max(0, min(5, row["page_index"] + offset))
+        target_page = max(0, min(LAST_PAGE_INDEX, row["page_index"] + offset))
 
         try:
             async with scouting_db_lock:

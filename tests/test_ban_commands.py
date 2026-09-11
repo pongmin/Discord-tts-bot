@@ -100,7 +100,16 @@ class ScoutingCommandFixture(unittest.IsolatedAsyncioTestCase):
         # channel.send must return something with a real int .id: the
         # persistent-report code path stores it as a SQLite PK
         # (scouting_db.save_ban_report), which a bare MagicMock id can't bind.
-        channel.send.side_effect = lambda *a, **kw: SimpleNamespace(id=next(cls._next_message_id))
+        # .edit is what the progress status message is updated through, and
+        # channel.sent_messages keeps them so a test can read those edits.
+        channel.sent_messages = []
+
+        def send(*args, **kwargs):
+            message = SimpleNamespace(id=next(cls._next_message_id), edit=AsyncMock())
+            channel.sent_messages.append(message)
+            return message
+
+        channel.send.side_effect = send
         interaction = SimpleNamespace(
             user=SimpleNamespace(id=user_id), guild_id=guild_id, channel=channel,
             response=SimpleNamespace(send_message=AsyncMock()),
@@ -222,7 +231,9 @@ class BanCommandTests(ScoutingCommandFixture):
 
         self.assertEqual(job.status.value, "completed")
         self.assertEqual(self.collect.await_count, 10)
-        channel.send.assert_awaited_once()
+        # Two sends: the progress status message, then the report.
+        self.assertEqual(channel.send.await_count, 2)
+        self.assertIn("밴 추천 분석 중", channel.send.await_args_list[0].args[0])
         sent = channel.send.call_args.kwargs
         view = sent["view"]
         self.addCleanup(view.stop)
@@ -238,6 +249,65 @@ class BanCommandTests(ScoutingCommandFixture):
         self.assertEqual(row["page_index"], 0)
         self.assertEqual(len(db.ban_report_opponents(row)), 5)
 
+    async def test_status_message_marks_each_player_done_then_the_calculation(self):
+        slash = self._bot_with_ban_commands()
+        interaction, channel = self._interaction()
+
+        await slash.callback(interaction, **self.inputs)
+        key = command._team_key(command.parse_inputs(self.inputs))
+        await self.jobs.get(key).task
+
+        # The status message is the first thing sent, and suppresses mentions.
+        self.assertIsNotNone(channel.send.await_args_list[0].kwargs.get("allowed_mentions"))
+        status_message = channel.sent_messages[0]
+        renders = [call.kwargs["content"] for call in status_message.edit.await_args_list]
+        self.assertTrue(renders)
+
+        # Every role ends up ✅, and the counter tracks them one at a time.
+        for index, role in enumerate(command.ROLE_INPUTS, start=1):
+            label = command.ROLE_LABELS[role]
+            self.assertTrue(
+                any(f"✅ {label} — {self.inputs[role]}" in render for render in renders),
+                f"{label} never marked done",
+            )
+            self.assertTrue(any(f"{index} / 5 완료" in render for render in renders))
+
+        # Exactly one player is in-flight at a time while collecting.
+        for render in renders:
+            self.assertLessEqual(render.count("⏳"), 1)
+
+        self.assertTrue(any("✅ 5 / 5 수집 완료 · 밴 계산 중..." in render for render in renders))
+        final = renders[-1]
+        self.assertEqual(final.count("✅ "), 6)  # five players + the footer
+        self.assertIn("분석 완료", final)
+        self.assertNotIn("⬜", final)
+
+    async def test_status_message_failures_do_not_fail_the_job(self):
+        slash = self._bot_with_ban_commands()
+        interaction, channel = self._interaction()
+        # Both the initial send and every edit are broken: the analysis must
+        # still run to completion and deliver its report.
+        original_send = channel.send.side_effect
+        calls = itertools.count()
+
+        def flaky_send(*args, **kwargs):
+            message = original_send(*args, **kwargs)
+            if next(calls) == 0:
+                raise RuntimeError("status send failed")
+            return message
+
+        channel.send.side_effect = flaky_send
+
+        await slash.callback(interaction, **self.inputs)
+        key = command._team_key(command.parse_inputs(self.inputs))
+        job = self.jobs.get(key)
+        await job.task
+
+        self.assertEqual(job.status.value, "completed")
+        view = channel.send.call_args.kwargs["view"]
+        self.addCleanup(view.stop)
+        self.assertIn("TOP", channel.send.call_args.kwargs["embed"].title)
+
     async def test_failure_is_reported_to_the_channel_with_the_failing_player_and_stage(self):
         slash = self._bot_with_ban_commands()
         interaction, channel = self._interaction()
@@ -251,7 +321,7 @@ class BanCommandTests(ScoutingCommandFixture):
         self.assertEqual(job.status.value, "failed")
         self.assertIn("계정 없음", job.error)
         self.collect.assert_not_awaited()
-        channel.send.assert_awaited_once()
+        self.assertEqual(channel.send.await_count, 2)  # status message, then the failure
         message = channel.send.call_args.args[0]
         self.assertIn("TOP 계정 조회 (Player0#TEST)", message)
         self.assertIn("계정 없음", message)
@@ -311,7 +381,7 @@ class BanCommandTests(ScoutingCommandFixture):
         await slash.callback(interaction, **self.inputs)
         await self.jobs.get(key).task
         self.collect.assert_not_awaited()
-        self.assertEqual(channel.send.await_count, 2)
+        self.assertEqual(channel.send.await_count, 4)  # status + report, twice
 
     async def test_depth_caps_upgrade_and_skip_independent_of_fetch_state(self):
         for depth, cap in (("quick", 30), ("normal", 100), ("deep", 200)):
@@ -488,7 +558,9 @@ class ClashBanCommandTests(ScoutingCommandFixture):
     @staticmethod
     def _clash_interaction(user_id: int = 123):
         channel = SimpleNamespace(id=999, send=AsyncMock())
-        channel.send.side_effect = lambda *a, **kw: SimpleNamespace(id=next(ScoutingCommandFixture._next_message_id))
+        channel.send.side_effect = lambda *a, **kw: SimpleNamespace(
+            id=next(ScoutingCommandFixture._next_message_id), edit=AsyncMock()
+        )
         interaction = SimpleNamespace(
             user=SimpleNamespace(id=user_id), guild_id=555, channel=channel,
             response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
@@ -520,7 +592,8 @@ class ClashBanCommandTests(ScoutingCommandFixture):
 
         self.assertEqual(job.status.value, "completed")
         self.assertEqual(self.collect.await_count, 10)
-        channel.send.assert_awaited_once()
+        self.assertEqual(channel.send.await_count, 2)  # status message, then the report
+        self.assertIn("밴 추천 분석 중", channel.send.await_args_list[0].args[0])
         view = channel.send.call_args.kwargs["view"]
         self.addCleanup(view.stop)
         self.assertIn("TOP", channel.send.call_args.kwargs["embed"].title)

@@ -16,6 +16,7 @@ import discord
 from riot import champion_data
 from riot import champion_emoji
 from scouting.ban_algorithm import BanImpact, PlayerModel, Recommendation, player_threat_scores
+from scouting.ban_alternatives import AlternativeBanSet, alternative_ban_sets
 from scouting.ban_attribution import (
     DOMINANT_SHARE, ONE_TRICK_P_PERSONAL, BanAttribution, PlayerAttribution, attribute_bans,
 )
@@ -31,6 +32,11 @@ TIER_LABELS = {
     "MASTER": "마스터", "GRANDMASTER": "그랜드마스터", "CHALLENGER": "챌린저",
 }
 MAX_DISPLAY_CHAMPIONS = 8
+# Five player pages, the summary, then the alternatives page.
+PAGE_COUNT = len(ROLE_ORDER) + 2
+LAST_PAGE_INDEX = PAGE_COUNT - 1
+SUMMARY_PAGE_INDEX = len(ROLE_ORDER)
+ALTERNATIVES_PAGE_INDEX = SUMMARY_PAGE_INDEX + 1
 EXHAUSTION_WARNING = (
     "관측된 챔피언 풀이 모두 밴되어 미관측 챔피언 추정값을 사용 중입니다. "
     "해당 선수의 포지션 평균 수준으로 추정하며, 전투력이 0이라는 뜻은 아닙니다."
@@ -281,7 +287,7 @@ def _add_blocks(embed: discord.Embed, name: str, blocks: list[str]) -> None:
 
 def _embed(role: str, page_index: int) -> discord.Embed:
     embed = discord.Embed(title=f"{role} · 스카우팅 리포트", colour=0x5865F2)
-    embed.set_footer(text=f"{page_index + 1} / 6 · 이전·다음 버튼으로 이동")
+    embed.set_footer(text=f"{page_index + 1} / {PAGE_COUNT} · 이전·다음 버튼으로 이동")
     return embed
 
 
@@ -400,7 +406,7 @@ def _reason(attribution: BanAttribution | None) -> str:
 
 
 def render_summary_page(result: Recommendation) -> discord.Embed:
-    embed = _embed("종합 밴 추천", 5)
+    embed = _embed("종합 밴 추천", SUMMARY_PAGE_INDEX)
     embed.description = "상대 5명의 포지션 기록을 바탕으로 분석한 밴 우선순위입니다."
     _add_blocks(embed, "추천 밴 1~3위", [_ban_line(result, impact, index)
                 for index, impact in enumerate(result.recommended, 1)])
@@ -421,9 +427,106 @@ def render_summary_page(result: Recommendation) -> discord.Embed:
     return embed
 
 
+def _alternative_title(index: int, alternative: AlternativeBanSet) -> str:
+    """대안 번호 + 이 조합이 왜 대안인지 한눈에 보이는 짧은 라벨."""
+    if alternative.reason == "role_focus" and alternative.focus_role:
+        label = f"{ROLE_LABELS[alternative.focus_role]} 집중"
+    elif alternative.reason == "one_trick":
+        label = "원챔 집중"
+    elif alternative.reason == "high_threat_block":
+        label = "고위험 대체픽 차단"
+    else:
+        label = f"밴 {alternative.differing}개 교체"
+    return f"대안 {index} · {label}"
+
+
+def _alternative_reason(alternative: AlternativeBanSet) -> str:
+    """이 조합을 최적안과 갈라놓는 실제 근거 한 줄 + 포기하는 밴.
+
+    문장을 고르는 값은 전부 이미 계산된 것들(P_personal, 위험도, 그리고 추천
+    1~3위가 쓰는 영향도)이라 같은 입력이면 항상 같은 문장이 나옴.
+    """
+    focus = _champion_name(alternative.focus_champion_id, alternative.focus_name or "")
+    role = ROLE_LABELS.get(alternative.focus_role or "", "상대")
+
+    if alternative.reason == "role_focus":
+        reason = f"{role}의 주력 풀을 밴 {alternative.focus_bans}개로 집중해서 압박합니다."
+    elif alternative.reason == "one_trick":
+        reason = f"{role}의 원챔 {focus} 의존도를 직접 깹니다."
+    elif alternative.reason == "high_threat_block":
+        reason = f"최적안이 남겨 두는 고위험 대체픽 {focus} 차단을 우선합니다."
+    elif alternative.differing == 1 and alternative.dropped and alternative.added:
+        out = _champion_name(alternative.dropped[0], alternative.dropped_names[0])
+        into = _champion_name(alternative.added[0], alternative.added_names[0])
+        reason = f"최적안의 {out} 밴을 {into} 밴으로 바꾼 조합입니다."
+    else:
+        reason = f"최적안과 밴 {alternative.differing}개가 다른 조합입니다."
+
+    if not alternative.dropped:
+        return f"→ {reason}"
+    # Dropped bans are ordered by the same 영향도 the summary page shows.
+    given_up = _champion_name(alternative.dropped[0], alternative.dropped_names[0])
+    if len(alternative.dropped) > 1:
+        given_up = f"{given_up} 등 {len(alternative.dropped)}개"
+    return f"→ {reason} 대신 {given_up} 밴을 포기합니다."
+
+
+def _ban_set_line(result: Recommendation, bans: tuple[int, ...], names: tuple[str, ...]) -> str:
+    by_id = {cid: name for cid, name in zip(bans, names, strict=True)}
+    ordered = sorted(bans, key=lambda cid: (-_ban_priority(result, cid), cid))
+    return " / ".join(_champion_label(cid, by_id[cid]) for cid in ordered)
+
+
+def _ban_priority(result: Recommendation, champion_id: int) -> float:
+    """가장 강한 밴이 앞에 오도록 하는 정렬 키(표시 순서 전용)."""
+    champions = [p.champions[champion_id] for p in result.players if champion_id in p.champions]
+    return max((c.candidate_score for c in champions), default=0.0)
+
+
+def _loss_text(alternative: AlternativeBanSet) -> str:
+    # A tie with B* is possible (equal aggregate, different champions); saying
+    # "-0.0%p" there would read as a rounding artifact rather than a tie.
+    if alternative.loss * 100 < 0.05:
+        return "최적안과 거의 동일"
+    return f"최적안 대비 -{alternative.loss * 100:.1f}%p"
+
+
+def render_alternatives_page(result: Recommendation) -> discord.Embed:
+    """7페이지: 최적안은 그대로 두고, 충분히 다른 3밴 조합 2개를 보여줌.
+
+    점수 2·3등을 그냥 나열하지 않음 - 최적안과 1개만 다른 최선, 2개 이상
+    다른 최선을 각각 뽑아 최적안 대비 손해와 함께 보여줌. 최적안, 추천 순위,
+    탐색 자체는 전혀 건드리지 않는 표시 전용 페이지임.
+    """
+    embed = _embed("대안 밴 조합", ALTERNATIVES_PAGE_INDEX)
+    embed.description = "최적 조합 대신 가져갈 수 있는 3밴 조합입니다. 최적 조합 자체는 바뀌지 않습니다."
+    embed.add_field(
+        name="현재 최적 조합",
+        # 요약 페이지의 추천 1~3위와 같은 순서(영향도 순).
+        value=(" / ".join(_champion_label(impact.champion_id, impact.name)
+                          for impact in result.recommended)
+               + f"\n예상 위협 감소 {result.threat_reduction:.1%}"),
+        inline=False,
+    )
+    alternatives = alternative_ban_sets(result)
+    if not alternatives:
+        embed.add_field(name="대안 조합", value="후보 챔피언이 부족해 대안 조합을 찾지 못했습니다.", inline=False)
+        return embed
+    for index, alternative in enumerate(alternatives, 1):
+        embed.add_field(
+            name=_alternative_title(index, alternative),
+            value=(f"{_ban_set_line(result, alternative.bans, alternative.names)}\n"
+                   f"예상 위협 감소 {alternative.threat_reduction:.1%} · "
+                   f"{_loss_text(alternative)}\n"
+                   f"{_alternative_reason(alternative)}"),
+            inline=False,
+        )
+    return embed
+
+
 class ScoutingReportView(discord.ui.View):
     """
-    6페이지 스카우팅 리포트 view. 스카우팅 리포트는 오래 열어볼 수 있어야 하므로
+    7페이지 스카우팅 리포트 view(선수 5 + 종합 + 대안 조합). 스카우팅 리포트는 오래 열어볼 수 있어야 하므로
     timeout=None(persistent view)으로 두고, 버튼에는 프로세스 재시작 후에도
     같은 문자열로 유지되는 고정 custom_id를 둠 - 그래야 discord.py가 재시작 후
     (원래 이 view 객체는 사라진 상태에서도) 같은 custom_id로 등록해 둔
@@ -447,7 +550,7 @@ class ScoutingReportView(discord.ui.View):
         self.result = result
         self.presentations = presentations
         self.owner_id = owner_id
-        self.page_index = max(0, min(5, page_index))
+        self.page_index = max(0, min(LAST_PAGE_INDEX, page_index))
         self.on_page_change = on_page_change
         self.message: discord.Message | discord.InteractionMessage | None = None
         self._page_lock = asyncio.Lock()
@@ -456,6 +559,7 @@ class ScoutingReportView(discord.ui.View):
         self.pages = [render_player_page(result, player, presentations.get(player.player_id, PlayerPresentation()), index)
                       for index, player in enumerate(self.players)]
         self.pages.append(render_summary_page(result))
+        self.pages.append(render_alternatives_page(result))
         self._profile_button: discord.ui.Button | None = None
         self._sync_buttons()
 
@@ -465,11 +569,11 @@ class ScoutingReportView(discord.ui.View):
 
     def _sync_buttons(self) -> None:
         self.previous_page.disabled = self.page_index == 0
-        self.next_page.disabled = self.page_index == 5
+        self.next_page.disabled = self.page_index == LAST_PAGE_INDEX
         if self._profile_button is not None:
             self.remove_item(self._profile_button)
             self._profile_button = None
-        if self.page_index < 5:
+        if self.page_index < SUMMARY_PAGE_INDEX:
             player = self.players[self.page_index]
             presentation = self.presentations.get(player.player_id, PlayerPresentation())
             if presentation.opgg_url:
@@ -484,7 +588,7 @@ class ScoutingReportView(discord.ui.View):
 
     async def _move(self, interaction: discord.Interaction, offset: int) -> None:
         async with self._page_lock:
-            self.page_index = max(0, min(5, self.page_index + offset))
+            self.page_index = max(0, min(LAST_PAGE_INDEX, self.page_index + offset))
             self._sync_buttons()
             await interaction.response.edit_message(content=None, embed=self.current_embed,
                                                     view=self, allowed_mentions=discord.AllowedMentions.none())

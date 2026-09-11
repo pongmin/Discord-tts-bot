@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import replace
+from itertools import combinations
 import math
 from types import SimpleNamespace
 import unittest
@@ -15,10 +16,11 @@ from scouting.ban_algorithm import (
     BanImpact, ChampionModel, PlayerDiagnostic, PlayerModel, Recommendation,
     SearchResult, geometric_mean,
 )
+from scouting.ban_alternatives import _classify, alternative_ban_sets
 from scouting.ban_attribution import attribute_ban, attribute_bans
 from scouting.ban_report_ui import (
     TIER_LABELS, PlayerPresentation, ScoutingReportView, _reason,
-    render_player_page, render_summary_page, stability_label,
+    render_alternatives_page, render_player_page, render_summary_page, stability_label,
 )
 
 
@@ -402,7 +404,7 @@ class ScoutingReportViewTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(user=SimpleNamespace(id=user_id), message=None,
                                response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock()))
 
-    async def test_six_pages_edit_same_message_and_change_profile_links(self):
+    async def test_seven_pages_edit_same_message_and_change_profile_links(self):
         self.assertEqual(self.view.page_index, 0)
         self.assertTrue(button(self.view, "이전").disabled)
         interaction = self.interaction()
@@ -419,8 +421,15 @@ class ScoutingReportViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("종합", embed_text(self.view.current_embed))
         self.assertFalse(self.view.current_embed.thumbnail.url)
         self.assertFalse(any(getattr(child, "url", None) for child in self.view.children))
+        self.assertFalse(button(self.view, "다음").disabled)
+        # The alternatives page is the last one, and carries no profile link.
+        await button(self.view, "다음").callback(interaction)
+        self.assertEqual(self.view.page_index, 6)
+        self.assertIn("대안", embed_text(self.view.current_embed))
+        self.assertFalse(any(getattr(child, "url", None) for child in self.view.children))
         self.assertTrue(button(self.view, "다음").disabled)
-        self.assertEqual(interaction.response.edit_message.await_count, 5)
+        self.assertEqual(interaction.response.edit_message.await_count, 6)
+        await button(self.view, "이전").callback(interaction)
         await button(self.view, "이전").callback(interaction)
         self.assertEqual(self.view.page_index, 4)
         self.assertEqual(button(self.view, "OP.GG 보기").url, presentation(4).opgg_url)
@@ -433,14 +442,14 @@ class ScoutingReportViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(interaction.response.send_message.await_args.kwargs["ephemeral"])
         self.assertTrue(await self.view.interaction_check(self.interaction()))
 
-    async def test_stale_boundary_clicks_cannot_leave_the_six_pages(self):
+    async def test_stale_boundary_clicks_cannot_leave_the_seven_pages(self):
         interaction = self.interaction()
         await button(self.view, "이전").callback(interaction)
         self.assertEqual(self.view.page_index, 0)
-        for _ in range(6):
+        for _ in range(8):
             await button(self.view, "다음").callback(interaction)
-        self.assertEqual(self.view.page_index, 5)
-        for _ in range(6):
+        self.assertEqual(self.view.page_index, 6)
+        for _ in range(8):
             await button(self.view, "이전").callback(interaction)
         self.assertEqual(self.view.page_index, 0)
 
@@ -473,7 +482,7 @@ class ScoutingReportViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.page_index, 3)
         out_of_range = ScoutingReportView(self.result, self.presentations, owner_id=123, page_index=99)
         self.addCleanup(out_of_range.stop)
-        self.assertEqual(out_of_range.page_index, 5)
+        self.assertEqual(out_of_range.page_index, 6)
 
 
 def attribution_champion(cid, p_personal, p_final, threat):
@@ -606,3 +615,93 @@ class BanAttributionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AlternativeBanSetTests(unittest.TestCase):
+    """7페이지 대안 조합: 최적안과 '얼마나 다른지'로 뽑히는지, 그리고 설명이
+    실제 모델 값에서 deterministic하게 나오는지만 확인함."""
+
+    def setUp(self):
+        self.result = recommendation()
+
+    def value(self, bans):
+        baselines = [p.strength() for p in self.result.players]
+        return geometric_mean(
+            tuple((p.strength(bans) / b) * p.dependency(bans)
+                  for p, b in zip(self.result.players, baselines)),
+            self.result.weights,
+        )
+
+    def test_alternatives_are_the_best_set_at_each_distance_from_the_optimum(self):
+        best = set(self.result.best_by_rho[0].bans)
+        one, many = alternative_ban_sets(self.result)
+        self.assertEqual(one.differing, 1)
+        self.assertGreaterEqual(many.differing, 2)
+
+        # Brute force the same space: each alternative must be the minimum
+        # aggregate among sets at its own distance, never merely 2nd/3rd place.
+        for alternative in (one, many):
+            rivals = [
+                self.value(bans)
+                for bans in combinations(self.result.candidates, 3)
+                if len(set(bans) - best) == alternative.differing
+            ]
+            self.assertAlmostEqual(alternative.value, min(rivals))
+            self.assertAlmostEqual(alternative.threat_reduction, 1 - alternative.value)
+            self.assertEqual(set(alternative.added), set(alternative.bans) - best)
+            self.assertEqual(set(alternative.dropped), best - set(alternative.bans))
+            self.assertGreaterEqual(alternative.loss, 0.0)
+
+    def test_reason_prefers_role_focus_then_one_trick_then_threat_then_swap(self):
+        # TOP plays 1 and 6; MID's 8 is a one-trick; 5 is the high-threat pick.
+        players = [
+            attribution_player(0, {1: attribution_champion(1, 0.5, 0.5, 1.0),
+                                   6: attribution_champion(6, 0.5, 0.5, 1.0)}),
+            attribution_player(1, {2: attribution_champion(2, 0.5, 0.5, 1.0)}),
+            attribution_player(2, {3: attribution_champion(3, 0.4, 0.4, 1.0),
+                                   8: attribution_champion(8, 0.9, 0.6, 1.0),
+                                   5: attribution_champion(5, 0.2, 0.2, 1.4)}),
+            attribution_player(3, {4: attribution_champion(4, 0.5, 0.5, 1.0)}),
+            attribution_player(4, {7: attribution_champion(7, 0.5, 0.5, 1.0)}),
+        ]
+        result = attribution_result(players, bans=(1, 2, 3))
+        best = frozenset((1, 2, 3))
+
+        def classify(bans):
+            added = tuple(cid for cid in bans if cid not in best)
+            dropped = tuple(sorted(best - set(bans)))
+            return _classify(result, bans, best, added, dropped)
+
+        # Two bans on TOP, where B* only had one there.
+        self.assertEqual(classify((1, 6, 2))[:2], ("role_focus", "TOP"))
+        # No role piled onto, but a one-trick deleted.
+        self.assertEqual(classify((1, 2, 8))[:3], ("one_trick", "MIDDLE", 8))
+        # Neither, but the swap closes a higher-threat pick than it gives up.
+        self.assertEqual(classify((1, 2, 5))[:3], ("high_threat_block", "MIDDLE", 5))
+        # A plain trade with no structural story.
+        self.assertEqual(classify((1, 2, 4))[0], "swap")
+
+    def test_page_shows_both_alternatives_with_their_cost_against_the_optimum(self):
+        with patch.object(champion_data, "champion_name",
+                          side_effect=champion_data.ChampionDataNotLoadedError("no cache")), \
+             patch.object(champion_emoji, "emoji_markup",
+                          side_effect=champion_emoji.ChampionEmojiNotLoadedError("no cache")):
+            embed = render_alternatives_page(self.result)
+        text = embed_text(embed)
+        self.assertIn("현재 최적 조합", text)
+        self.assertIn("대안 1", text)
+        self.assertIn("대안 2", text)
+        self.assertEqual(text.count("예상 위협 감소"), 3)
+        self.assertEqual(text.count("→"), 2)
+        self.assertEqual(embed.footer.text.split(" · ")[0], "7 / 7")
+        # The optimum itself is untouched by rendering the page.
+        self.assertEqual(self.result.best_by_rho[0].bans, recommendation().best_by_rho[0].bans)
+
+    def test_too_few_candidates_leaves_the_page_without_alternatives(self):
+        only_best = replace(self.result, candidates=self.result.best_by_rho[0].bans)
+        self.assertEqual(alternative_ban_sets(only_best), ())
+        with patch.object(champion_data, "champion_name",
+                          side_effect=champion_data.ChampionDataNotLoadedError("no cache")), \
+             patch.object(champion_emoji, "emoji_markup",
+                          side_effect=champion_emoji.ChampionEmojiNotLoadedError("no cache")):
+            self.assertIn("대안 조합을 찾지 못했습니다", embed_text(render_alternatives_page(only_best)))

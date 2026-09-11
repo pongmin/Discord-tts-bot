@@ -17,7 +17,7 @@ residual times the dependency penalty: r(p,B) = r_perf(p,B) * D(p,B).
 
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 import math
 
@@ -50,6 +50,11 @@ TIERS = (
     "IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD",
     "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER",
 )
+# Missing rank info is treated as "unknown", not "weak": a player with no
+# recognized current solo-queue tier borrows the average raw rank_score of
+# their ranked opponents (see recommend_bans). Only when all five opponents
+# are unranked does this fixed midpoint of the [1, 10] tier scale apply.
+DEFAULT_NEUTRAL_RANK_SCORE = 5.5
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,11 @@ class PlayerModel:
     warnings: tuple[str, ...] = ()
     kda_baseline: float = 0.0
     p_others: float = OTHERS_EPSILON
+    # False means rank_score is not this player's own: build_player_model set
+    # it to a temporary placeholder, and recommend_bans overwrites it with the
+    # team-neutral fallback (opponent average, or DEFAULT_NEUTRAL_RANK_SCORE)
+    # once all five opponents' models are known.
+    is_ranked: bool = True
 
     def strength(self, bans: Collection[int] = frozenset()) -> float:
         remaining = [c for cid, c in self.champions.items() if cid not in bans]
@@ -176,15 +186,14 @@ class Recommendation:
         return 1 - self.best_by_rho[0].value
 
 
-def solo_rank_score(tier: str | None, lp: int | None) -> float:
+def solo_rank_score(tier: str, lp: int | None) -> float:
     # Placeholder strength scale, NOT calibrated: IRON=1 ... CHALLENGER=10
     # (including EMERALD). LP adds <0.01, so even elite LP cannot cross tiers.
-    # Missing/unranked snapshots receive the same base weight as IRON, 1.
-    tier = (tier or "").upper()
-    if tier not in TIERS:
-        return 1.0
+    # Callers must pass a recognized tier (see TIERS); unranked/missing
+    # snapshots are resolved by recommend_bans as a team-neutral fallback,
+    # not routed through here as if they were IRON.
     points = max(0, lp or 0)
-    return TIERS.index(tier) + 1 + 0.01 * points / (points + 100)
+    return TIERS.index(tier.upper()) + 1 + 0.01 * points / (points + 100)
 
 
 def build_player_model(repo: ScoutingRepo, player_id: int, role: str) -> PlayerModel:
@@ -274,10 +283,23 @@ def build_player_model(repo: ScoutingRepo, player_id: int, role: str) -> PlayerM
         )
 
     rank = repo.get_latest_rank_snapshot(player_id, RANKED_SOLO_QUEUE_TYPE)
-    if rank is None or (rank["tier"] or "").upper() not in TIERS:
-        notes.append(f"{label}: no recognized solo-queue tier at cutoff; placeholder rank weight = 1.")
-    score = solo_rank_score(rank["tier"], rank["lp"]) if rank else 1.0
-    return PlayerModel(player_id, label, role, champions, baseline, score, tuple(notes), kda_baseline, p_others)
+    tier = (rank["tier"] or "").upper() if rank else ""
+    is_ranked = tier in TIERS
+    if is_ranked:
+        score = solo_rank_score(tier, rank["lp"])
+    else:
+        # Placeholder only: recommend_bans overwrites this once it knows the
+        # other four opponents' rank_score, per is_ranked=False above.
+        score = 0.0
+        notes.append(
+            f"{label}: no recognized solo-queue tier at cutoff; rank weight uses the "
+            "team-neutral fallback (opponents' average rank_score, or "
+            f"{DEFAULT_NEUTRAL_RANK_SCORE} if all five are unranked)."
+        )
+    return PlayerModel(
+        player_id, label, role, champions, baseline, score, tuple(notes),
+        kda_baseline, p_others, is_ranked,
+    )
 
 
 def arithmetic_mean(residuals: Sequence[float], weights: Sequence[float]) -> float:
@@ -334,6 +356,19 @@ def recommend_bans(repo: ScoutingRepo, opponents: Sequence[tuple[int, str]]) -> 
     if len(opponents) != 5 or len({player_id for player_id, _ in opponents}) != 5:
         raise ValueError("Provide exactly five distinct opposing players with their roles.")
     players = tuple(build_player_model(repo, player_id, role) for player_id, role in opponents)
+    # Rank absence means "unknown", not "weak": fill each unranked opponent's
+    # rank_score with the average of this same team's ranked opponents (or
+    # the fixed midpoint DEFAULT_NEUTRAL_RANK_SCORE if none of the five are
+    # ranked) before any player-weight normalization runs.
+    ranked_scores = [p.rank_score for p in players if p.is_ranked]
+    neutral_score = (
+        math.fsum(ranked_scores) / len(ranked_scores) if ranked_scores
+        else DEFAULT_NEUTRAL_RANK_SCORE
+    )
+    players = tuple(
+        p if p.is_ranked else replace(p, rank_score=neutral_score)
+        for p in players
+    )
     total_rank = math.fsum(p.rank_score for p in players)
     weights = tuple(p.rank_score / total_rank for p in players)
     candidates = tuple(sorted({cid for p in players for cid in p.candidate_champions()}))
@@ -410,6 +445,59 @@ def recommend_bans(repo: ScoutingRepo, opponents: Sequence[tuple[int, str]]) -> 
         players, weights, candidates, best_by_rho, tuple(recommended),
         tuple(alternatives[:5]), diagnostics, tuple(notes),
     )
+
+
+# Shrinkage strength for role_wr_adj below. Reuses K's magnitude by design
+# (same shrink-strength convention as champion-level wr_adj), but the prior
+# it shrinks toward is fixed at PLAYER_THREAT_WR_PRIOR (0.5), not a player's
+# own baseline_winrate, so this is an independent constant, not a shared one.
+PLAYER_THREAT_WR_PRIOR = 0.5
+# Weighted-geometric exponents for player_threat_scores below (sum to 1).
+# Rank is deliberately the dominant factor; form and pool are secondary
+# tiebreakers, not co-equal with rank.
+PLAYER_THREAT_RANK_EXPONENT = 0.6
+PLAYER_THREAT_FORM_EXPONENT = 0.2
+PLAYER_THREAT_POOL_EXPONENT = 0.2
+
+
+def player_threat_scores(result: Recommendation) -> dict[int, float]:
+    """UI-only per-player threat, keyed by player_id: how much this specific
+    opponent stands out (baseline rank, recent role form, current champion
+    pool danger) relative to the other four - NOT champion Threat, NOT
+    Dependency, and NOT the optimizer's player weight (Recommendation.weights,
+    the rank_score share ban optimization actually uses). This is a display
+    metric only: it reads `result` but never feeds back into weights, the
+    exhaustive search, or any recommended ban - callers must not pass it into
+    recommend_bans or treat it as ban-optimization input.
+
+    player_threat_raw(p) = rank_factor(p)**0.6 * form_factor(p)**0.2 * pool_factor(p)**0.2
+    (a weighted geometric mean, rank-dominant by design), where:
+      rank_factor = p.rank_score / team_mean(rank_score)   -- baseline rank,
+        already resolved for Unranked players (see recommend_bans).
+      form_factor = role_wr_adj / PLAYER_THREAT_WR_PRIOR, where role_wr_adj is
+        this player's whole-role win rate, K-shrunk toward the fixed 0.5
+        prior (not their own baseline_winrate) -- recent role-level form,
+        1.0 at a neutral (0.5) win rate.
+      pool_factor = p.strength() -- the current champion pool's raw danger
+        (Dependency deliberately excluded).
+    The final value is player_threat_raw normalized to a team average of 1.0.
+    """
+    mean_rank_score = math.fsum(p.rank_score for p in result.players) / len(result.players)
+    raw_scores = {}
+    for p in result.players:
+        rank_factor = p.rank_score / mean_rank_score
+        role_games = sum(c.games for c in p.champions.values())
+        role_wins = sum(c.wins for c in p.champions.values())
+        role_wr_adj = (role_wins + K * PLAYER_THREAT_WR_PRIOR) / (role_games + K)
+        form_factor = role_wr_adj / PLAYER_THREAT_WR_PRIOR
+        pool_factor = p.strength()
+        raw_scores[p.player_id] = (
+            rank_factor ** PLAYER_THREAT_RANK_EXPONENT
+            * form_factor ** PLAYER_THREAT_FORM_EXPONENT
+            * pool_factor ** PLAYER_THREAT_POOL_EXPONENT
+        )
+    mean_raw = math.fsum(raw_scores.values()) / len(raw_scores)
+    return {player_id: raw / mean_raw for player_id, raw in raw_scores.items()}
 
 
 def format_recommendation(result: Recommendation) -> str:

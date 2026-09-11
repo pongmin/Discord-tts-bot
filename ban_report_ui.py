@@ -15,7 +15,7 @@ import discord
 
 import champion_data
 import champion_emoji
-from ban_algorithm import BanImpact, PlayerModel, Recommendation
+from ban_algorithm import BanImpact, PlayerModel, Recommendation, player_threat_scores
 
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ def _champion_label(champion_id: int | None, fallback: str) -> str:
 def _rank_text(presentation: PlayerPresentation) -> str:
     tier = (presentation.tier or "").upper()
     if tier not in TIER_LABELS:
-        return "미배치 / 정보 없음"
+        return "언랭크"
     text = TIER_LABELS[tier]
     if tier not in {"MASTER", "GRANDMASTER", "CHALLENGER"}:
         division = {"I": "1", "II": "2", "III": "3", "IV": "4"}.get(presentation.division)
@@ -127,6 +127,30 @@ def _rank_text(presentation: PlayerPresentation) -> str:
     if presentation.lp is not None:
         text += f" · {presentation.lp}점"
     return text
+
+
+def _player_threat_grade(threat: float) -> str:
+    if threat >= 1.10:
+        return "▲ 높음"
+    if threat >= 0.90:
+        return "● 보통"
+    return "▼ 낮음"
+
+
+def _player_threat_display(result: Recommendation, player: PlayerModel) -> tuple[str, str]:
+    """Grade + team-rank text for player.player_id, from the UI-only
+    player_threat_scores (rank baseline * recent role form * current
+    champion-pool danger) — NOT champion Threat, NOT Dependency, and NOT
+    Recommendation.weights (the optimizer's own player weight). Ties are
+    never forced apart: equal-scored players share the same rank number.
+    """
+    scores = player_threat_scores(result)
+    ordered = sorted(scores.values(), reverse=True)
+    own = scores[player.player_id]
+    rank = next(i for i, value in enumerate(ordered, 1) if math.isclose(value, own, rel_tol=1e-9, abs_tol=1e-9))
+    tied = sum(1 for value in ordered if math.isclose(value, own, rel_tol=1e-9, abs_tol=1e-9)) > 1
+    rank_text = f"공동 {rank}위" if tied else f"{rank}위"
+    return _player_threat_grade(own), rank_text
 
 
 def risk_label(threat: float) -> str:
@@ -155,7 +179,7 @@ def _translated_warning(warning: str) -> str:
     if "no meta observations" in warning:
         return "포지션별 비교 기록이 없어 개인 픽 기록과 미관측 챔피언의 최소 안전 확률로 분석했습니다."
     if "no recognized solo-queue tier at cutoff" in warning:
-        return "확인된 솔로랭크 티어가 없어 선수 간 비중 계산에 기본값을 사용했습니다."
+        return "랭크 정보 없음 · 팀 내 중립 가중치 적용 (상대 팀 랭크 보유 선수 평균, 전원 언랭 시 고정값 사용)"
     if "role-filtered games available" in warning:
         match = re.search(r"only (\d+) role-filtered games", warning)
         count = match.group(1) if match else "적은 수의"
@@ -264,6 +288,8 @@ def render_player_page(
         embed.set_thumbnail(url=presentation.profile_icon_url)
     champions = sorted(player.champions.values(), key=lambda champion: (-champion.p_final, champion.champion_id))
     count = sum(champion.games for champion in champions)
+    threat_grade, threat_rank_text = _player_threat_display(result, player)
+    embed.add_field(name="선수 위협도", value=f"{threat_grade} · 상대 팀 내 {threat_rank_text}", inline=True)
     embed.add_field(name="솔로랭크", value=_rank_text(presentation), inline=True)
     embed.add_field(name="포지션 분석 경기", value=f"{count:,}경기", inline=True)
     embed.add_field(name="포지션 승률", value=f"{player.baseline_winrate:.1%}", inline=True)

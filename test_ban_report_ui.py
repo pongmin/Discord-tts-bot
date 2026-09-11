@@ -15,7 +15,7 @@ from ban_algorithm import (
     SearchResult,
 )
 from ban_report_ui import (
-    PlayerPresentation, ScoutingReportView, render_player_page,
+    TIER_LABELS, PlayerPresentation, ScoutingReportView, render_player_page,
     render_summary_page, stability_label,
 )
 
@@ -72,6 +72,10 @@ def embed_text(embed):
 
 def utf16_length(value):
     return len(value.encode("utf-16-le")) // 2
+
+
+def field_value(embed, name):
+    return next(field.value for field in embed.fields if field.name.startswith(name))
 
 
 def button(view, label):
@@ -182,10 +186,14 @@ class ReportRendererTests(unittest.TestCase):
         self.assert_embed_limits(embed)
 
     def test_danger_boundaries(self):
+        # Scoped to the champion-pool field, since the page's separate
+        # "선수 위협도" field reuses the same ▲/●/▼ grade vocabulary for a
+        # different (player-weight) signal and would otherwise collide here.
         for threat, expected in ((0.899999, "▼ 낮음"), (0.9, "보통"), (1.099999, "보통"), (1.1, "▲ 높음")):
             with self.subTest(threat=threat):
                 player = replace(self.result.players[0], champions={1: champion(1, 1.0, threat)})
-                text = embed_text(render_player_page(self.result, player, presentation(), 0))
+                embed = render_player_page(self.result, player, presentation(), 0)
+                text = field_value(embed, "챔피언 풀")
                 self.assertIn(expected, text)
                 for other in {"▼ 낮음", "보통", "▲ 높음"} - {expected}:
                     self.assertNotIn(other, text)
@@ -255,7 +263,8 @@ class ReportRendererTests(unittest.TestCase):
         prefix = "Player0#KR1/TOP"
         warnings = (
             f"{prefix}: no meta observations in the seen pool; using personal probabilities.",
-            "Player0#KR1: no recognized solo-queue tier at cutoff; placeholder rank weight = 1.",
+            "Player0#KR1: no recognized solo-queue tier at cutoff; rank weight uses the "
+            "team-neutral fallback (opponents' average rank_score, or 5.5 if all five are unranked).",
             "An optimum exhausts an observed role champion pool: v1 assumes S=0 and r=0. With no unseen/Others bucket, this optimistic assumption can show 100% threat reduction under rho=0 or rho=-1.",
             "Negative marginal contribution for 잭스 (-0.000321): Threat/redistribution may redirect picks onto more threatening champions.",
             "An also-consider set exhausts an observed pool; its marginal value includes the optimistic v1 S=0 assumption (unseen/Others picks are not modeled).",
@@ -273,7 +282,7 @@ class ReportRendererTests(unittest.TestCase):
                 text = embed_text(embed) + embed_text(player_embed)
                 self.assertNotEqual(text, baseline)
                 self.assertIn("⚠", text)
-                for english in ("no meta observations", "placeholder rank weight", "An optimum", "Negative marginal", "An also-consider", "Recommendation is sensitive", "role-filtered", "rho=", "S=0", "0.000321"):
+                for english in ("no meta observations", "no recognized solo-queue tier", "team-neutral fallback", "An optimum", "Negative marginal", "An also-consider", "Recommendation is sensitive", "role-filtered", "rho=", "S=0", "0.000321"):
                     self.assertNotIn(english, text)
                 self.assert_embed_limits(embed)
                 self.assert_embed_limits(player_embed)
@@ -302,6 +311,54 @@ class ReportRendererTests(unittest.TestCase):
         self.assertTrue(any(label in text for label in ("정보 없음", "확인되지", "미배치", "미확인", "언랭크")))
         self.assertFalse(embed.thumbnail.url)
         self.assert_embed_limits(embed)
+
+    def test_unranked_rank_text_shows_unranked_not_a_placeholder_tier(self):
+        # An Unranked player must never read as if a real current tier were
+        # found - no tier label (골드, 다이아몬드, ...) may leak into "솔로랭크".
+        embed = render_player_page(self.result, self.result.players[0], PlayerPresentation(), 0)
+        text = field_value(embed, "솔로랭크")
+        self.assertEqual(text, "언랭크")
+        for tier_label in TIER_LABELS.values():
+            self.assertNotIn(tier_label, text)
+
+    def test_player_threat_grade_and_team_rank_track_the_ui_only_metric(self):
+        # 선수 위협도 must reflect player_threat_scores (rank baseline * recent
+        # role form * current pool danger), NOT Recommendation.weights (the
+        # optimizer's own player weight) or a raw champion Threat average.
+        # Every fixture player shares identical champions/games/wins, so
+        # player_threat reduces to rank_score / team-mean(rank_score) here -
+        # letting rank_score alone drive an unambiguous ordering plus a tie.
+        rank_scores = (8.0, 6.0, 5.0, 3.0, 3.0)
+        players = tuple(replace(p, rank_score=score) for p, score in zip(self.result.players, rank_scores))
+        result = replace(self.result, players=players)
+        expectations = {
+            0: ("▲ 높음", "1위"), 1: ("▲ 높음", "2위"), 2: ("● 보통", "3위"),
+            3: ("▼ 낮음", "공동 4위"), 4: ("▼ 낮음", "공동 4위"),
+        }
+        for index, (label, rank_text) in expectations.items():
+            with self.subTest(index=index):
+                embed = render_player_page(result, players[index], presentation(), 0)
+                text = field_value(embed, "선수 위협도")
+                self.assertIn(label, text)
+                self.assertIn(rank_text, text)
+
+    def test_player_threat_display_ignores_the_optimizer_player_weight_field(self):
+        # 선수 위협도 comes from player_threat_scores, which never reads
+        # Recommendation.weights - changing only weights (players untouched)
+        # must not change the field's text at all.
+        baseline = field_value(
+            render_player_page(self.result, self.result.players[0], presentation(), 0), "선수 위협도"
+        )
+        skewed_weights = replace(self.result, weights=(0.80, 0.05, 0.05, 0.05, 0.05))
+        text = field_value(
+            render_player_page(skewed_weights, skewed_weights.players[0], presentation(), 0), "선수 위협도"
+        )
+        self.assertEqual(text, baseline)
+
+    def test_player_threat_display_never_mutates_weights_or_recommended_bans(self):
+        before = deepcopy(self.result)
+        render_player_page(self.result, self.result.players[0], presentation(), 0)
+        self.assertEqual(self.result, before)
 
     def test_large_pools_and_astral_names_stay_within_discord_limits(self):
         champions = {

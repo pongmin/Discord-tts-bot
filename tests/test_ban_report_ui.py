@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import replace
+import math
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -12,11 +13,12 @@ from riot import champion_data
 from riot import champion_emoji
 from scouting.ban_algorithm import (
     BanImpact, ChampionModel, PlayerDiagnostic, PlayerModel, Recommendation,
-    SearchResult,
+    SearchResult, geometric_mean,
 )
+from scouting.ban_attribution import attribute_ban, attribute_bans
 from scouting.ban_report_ui import (
-    TIER_LABELS, PlayerPresentation, ScoutingReportView, render_player_page,
-    render_summary_page, stability_label,
+    TIER_LABELS, PlayerPresentation, ScoutingReportView, _reason,
+    render_player_page, render_summary_page, stability_label,
 )
 
 
@@ -239,7 +241,9 @@ class ReportRendererTests(unittest.TestCase):
             self.assertIn(name, text)
         self.assertIn("추천 안정성", text)
         self.assertIn("왜 이 밴인가?", text)
-        self.assertIn("3개 포지션", text)
+        # Reasons come from the marginal-contribution attribution, so the
+        # shared TOP/JUNGLE/MID pick is explained as a multi-player effect.
+        self.assertIn("동시에 영향", text)
         self.assertFalse(embed.thumbnail.url)
         for internal in ("B*", "rho", "V(B)", "[1]", "MIDDLE", "UTILITY", "marginal", "0.842", "0.052"):
             self.assertNotIn(internal, text)
@@ -470,6 +474,134 @@ class ScoutingReportViewTests(unittest.IsolatedAsyncioTestCase):
         out_of_range = ScoutingReportView(self.result, self.presentations, owner_id=123, page_index=99)
         self.addCleanup(out_of_range.stop)
         self.assertEqual(out_of_range.page_index, 5)
+
+
+def attribution_champion(cid, p_personal, p_final, threat):
+    return ChampionModel(cid, NAMES.get(cid, f"챔피언{cid}"), 10, 6, p_personal, 0.0, p_final, 0.6, threat)
+
+
+def attribution_player(index, champions, p_others=0.05):
+    return PlayerModel(200 + index, f"Player{index}#KR1", ROLES[index], champions, 0.5, 5.0, p_others=p_others)
+
+
+def attribution_result(players, bans=(1, 2, 3)):
+    """Minimal Recommendation whose B* is `bans`; only the parts the
+    explanation layer reads are populated."""
+    weights = tuple(1 / len(players) for _ in players)
+    return Recommendation(
+        tuple(players), weights, tuple(bans),
+        {rho: SearchResult(tuple(bans), 0.5, 1, 0, ()) for rho in (1, 0, -1)},
+        tuple(BanImpact(cid, NAMES.get(cid, str(cid)), (), 0.01) for cid in bans),
+        (), (), (),
+    )
+
+
+class BanAttributionTests(unittest.TestCase):
+    """The 'why this ban' layer must come from the B* vs B* - {c} comparison,
+    not from surface thresholds on pick share alone."""
+
+    def reason(self, result, champion_id):
+        with patch.object(champion_data, "champion_name",
+                          side_effect=champion_data.ChampionDataNotLoadedError("no cache")):
+            return _reason(attribute_ban(result, champion_id))
+
+    def test_total_delta_is_exactly_performance_plus_dependency(self):
+        # And it is the same quantity the optimizer reports as `marginal`,
+        # in log space: log V_0(B* - {c}) - log V_0(B*).
+        players = [
+            attribution_player(0, {1: attribution_champion(1, .6, .5, 1.8),
+                                   4: attribution_champion(4, .4, .45, 0.9)}),
+            attribution_player(1, {2: attribution_champion(2, .5, .5, 1.2),
+                                   3: attribution_champion(3, .5, .45, 1.1)}),
+        ]
+        result = attribution_result(players)
+        attribution = attribute_ban(result, 1)
+        self.assertAlmostEqual(attribution.total_delta,
+                               attribution.perf_delta + attribution.dep_delta)
+        for player in attribution.per_player:
+            self.assertAlmostEqual(player.total_delta, player.perf_delta + player.dep_delta)
+        full, without = {1, 2, 3}, {2, 3}
+        expected = math.log(
+            geometric_mean([p.residual_ratio(without) for p in players], result.weights)
+            / geometric_mean([p.residual_ratio(full) for p in players], result.weights)
+        )
+        self.assertAlmostEqual(attribution.total_delta, expected)
+
+    def test_performance_driven_ban_is_explained_by_performance(self):
+        # Small pick share, large champion threat: dependency can only account
+        # for ETA * 0.1, so the split has to land on performance.
+        players = [
+            attribution_player(0, {1: attribution_champion(1, .1, .1, 3.0),
+                                   4: attribution_champion(4, .9, .9, 1.0)}),
+            attribution_player(1, {2: attribution_champion(2, .5, .5, 1.0),
+                                   3: attribution_champion(3, .5, .45, 1.0)}),
+        ]
+        attribution = attribute_ban(attribution_result(players), 1)
+        self.assertGreater(attribution.perf_share, 0.65)
+        self.assertEqual(attribution.reasons[0], "performance")
+        self.assertIn("성과", self.reason(attribution_result(players), 1))
+
+    def test_dependency_driven_ban_is_explained_by_pick_reliance(self):
+        # Every threat is 1.0, so the performance half is exactly zero and the
+        # whole contribution is the dependency penalty.
+        players = [
+            attribution_player(0, {1: attribution_champion(1, .8, .5, 1.0),
+                                   4: attribution_champion(4, .2, .45, 1.0)}),
+            attribution_player(1, {2: attribution_champion(2, .5, .5, 1.0),
+                                   3: attribution_champion(3, .5, .45, 1.0)}),
+        ]
+        result = attribution_result(players)
+        attribution = attribute_ban(result, 1)
+        self.assertAlmostEqual(attribution.perf_delta, 0.0)
+        self.assertEqual(attribution.reasons[0], "dependency")
+        # p_personal >= 0.7 only chooses the "one-trick" wording here.
+        self.assertIn("원챔", self.reason(result, 1))
+
+    def test_one_champion_split_across_performance_and_dependency_names_both(self):
+        players = [
+            attribution_player(0, {1: attribution_champion(1, .1, .2, 3.0),
+                                   4: attribution_champion(4, .9, .8, 1.0)}),
+            attribution_player(1, {1: attribution_champion(1, .8, .5, 1.0),
+                                   5: attribution_champion(5, .2, .5, 1.0)}),
+            attribution_player(2, {2: attribution_champion(2, .5, .5, 1.0),
+                                   3: attribution_champion(3, .5, .45, 1.0)}),
+        ]
+        result = attribution_result(players)
+        attribution = attribute_ban(result, 1)
+        self.assertEqual(attribution.reasons[0], "split_perf_dep")
+        sentence = self.reason(result, 1)
+        self.assertIn("Player0#KR1", sentence)
+        self.assertIn("Player1#KR1", sentence)
+
+    def test_ban_that_only_pays_off_inside_the_combination_says_so(self):
+        # Banning 1 alone pushes this player onto champion 2 (threat 3.0), so
+        # the solo effect is negligible; with 2 also banned it is not.
+        players = [
+            attribution_player(0, {1: attribution_champion(1, .3, .35, 1.2),
+                                   2: attribution_champion(2, .3, .35, 3.0),
+                                   4: attribution_champion(4, .4, .3, 0.4)}),
+            attribution_player(1, {3: attribution_champion(3, .5, .5, 1.2),
+                                   5: attribution_champion(5, .5, .5, 1.0)}),
+        ]
+        result = attribution_result(players)
+        attribution = attribute_ban(result, 1)
+        self.assertLess(attribution.solo_delta, 0.5 * attribution.total_delta)
+        self.assertEqual(attribution.partner_id, 2)
+        self.assertGreater(attribution.partner_gain, 0)
+        self.assertEqual(attribution.reasons[1], "weak_solo_strong_combination")
+        self.assertIn("케인", self.reason(result, 1))
+
+    def test_explaining_a_ban_never_mutates_the_recommendation(self):
+        players = [
+            attribution_player(0, {1: attribution_champion(1, .6, .5, 1.8),
+                                   4: attribution_champion(4, .4, .45, 0.9)}),
+            attribution_player(1, {2: attribution_champion(2, .5, .5, 1.2),
+                                   3: attribution_champion(3, .5, .45, 1.1)}),
+        ]
+        result = attribution_result(players)
+        before = deepcopy(result)
+        self.assertEqual(set(attribute_bans(result)), {1, 2, 3})
+        self.assertEqual(result, before)
 
 
 if __name__ == "__main__":

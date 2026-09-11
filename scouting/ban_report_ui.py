@@ -16,6 +16,9 @@ import discord
 from riot import champion_data
 from riot import champion_emoji
 from scouting.ban_algorithm import BanImpact, PlayerModel, Recommendation, player_threat_scores
+from scouting.ban_attribution import (
+    DOMINANT_SHARE, ONE_TRICK_P_PERSONAL, BanAttribution, PlayerAttribution, attribute_bans,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -67,9 +70,13 @@ def _display(text: str, limit: int = 80) -> str:
     return _clip(discord.utils.escape_mentions(discord.utils.escape_markdown(text)), limit)
 
 
-def _player_label(player: PlayerModel) -> str:
+def _label_text(label: str) -> str:
     # The algorithm has a numeric fallback for incomplete stored account names.
-    return "이름 미확인 선수" if re.fullmatch(r"Player \d+", player.label) else _display(player.label)
+    return "이름 미확인 선수" if re.fullmatch(r"Player \d+", label) else _display(label)
+
+
+def _player_label(player: PlayerModel) -> str:
+    return _label_text(player.label)
 
 
 def _champion_name(champion_id: int | None, fallback: str) -> str:
@@ -319,26 +326,77 @@ def _ban_line(result: Recommendation, impact: BanImpact, index: int) -> str:
     return f"**{index}. {_champion_label(impact.champion_id, impact.name)}** — {roles}\n영향도 {impact.marginal:.1%}"
 
 
-def _reason(result: Recommendation, impact: BanImpact) -> str:
-    players = _affected_players(result, impact)
-    if len(players) >= 2:
-        shared = " · 공유 밴 효율이 높음" if impact.marginal > 0 else ""
-        return f"{len(players)}개 포지션에 동시에 영향{shared}"
-    models = [player.champions[impact.champion_id] for player in players]
-    # These thresholds choose explanatory words only; no new score or ordering.
-    # Dependency framing uses p_personal (the pre-meta-blend pick share that
-    # actually drives the algorithm's Dependency penalty), not p_final, which
-    # meta backoff can inflate or deflate away from what the player themselves
-    # actually relies on.
-    if any(champion.p_personal >= 0.7 for champion in models):
-        return "압도적인 모스트 픽"
-    if any(champion.p_personal >= 0.5 for champion in models):
-        return "주력 픽 의존도가 높음"
-    if any(champion.p_final >= 0.2 and champion.threat >= 1.10 for champion in models):
-        return "높은 픽 비중과 위험도"
-    if any(champion.threat >= 1.10 for champion in models):
-        return "해당 포지션에서 위험도가 높은 픽"
-    return "전체 밴 조합에서 상대 챔피언 선택에 영향"
+def _lead(attribution: BanAttribution, axis: str) -> PlayerAttribution | None:
+    """Largest contributor whose own delta is led by `axis` (perf/dep)."""
+    share = (lambda p: p.perf_share) if axis == "perf" else (lambda p: p.dep_share)
+    return next((p for p in attribution.contributors if share(p) >= DOMINANT_SHARE), None)
+
+
+def _top_label(attribution: BanAttribution) -> str:
+    return _label_text(attribution.per_player[0].label) if attribution.per_player else "상대"
+
+
+def _reason_sentence(code: str, attribution: BanAttribution) -> str:
+    """One Korean sentence per reason code.
+
+    Every number quoted here comes from the attribution itself (the log-space
+    split of this ban's marginal contribution); p_personal and threat only
+    pick which wording applies, they are never the reason on their own.
+    """
+    top = _top_label(attribution)
+    partner = _champion_name(attribution.partner_id, attribution.partner_name or "")
+    perf_lead = _lead(attribution, "perf") or (attribution.per_player[0] if attribution.per_player else None)
+    dep_lead = _lead(attribution, "dep")
+    relied_on = max((p for p in attribution.per_player), key=lambda p: p.p_personal, default=None)
+
+    if code == "performance":
+        return (f"밴 효과의 {attribution.perf_share:.0%}가 {top} 선수의 챔피언 성과에서 나와, "
+                "이 챔피언을 잡았을 때의 위협을 직접 줄이는 밴입니다.")
+    if code == "dependency":
+        if relied_on is not None and relied_on.p_personal >= ONE_TRICK_P_PERSONAL:
+            return (f"{_label_text(relied_on.label)} 선수의 개인 픽 {relied_on.p_personal:.0%}를 차지하는 "
+                    "사실상 원챔이라, 차단하면 익숙한 챔피언 풀이 거의 남지 않습니다.")
+        return (f"밴 효과의 {attribution.dep_share:.0%}가 픽 의존도에서 나와, "
+                "차단 시 익숙한 챔피언 풀을 크게 줄일 수 있습니다.")
+    if code == "mixed":
+        return (f"{top} 선수의 챔피언 성과({attribution.perf_share:.0%})와 "
+                f"픽 의존도({attribution.dep_share:.0%})를 함께 차단합니다.")
+    if code == "split_perf_dep" and perf_lead is not None and dep_lead is not None:
+        return (f"{_label_text(perf_lead.label)} 선수에게는 높은 챔피언 성과를, "
+                f"{_label_text(dep_lead.label)} 선수에게는 높은 픽 의존도를 동시에 차단합니다.")
+    if code == "pool_exhaustion":
+        exhausted = " · ".join(_label_text(p.label) for p in attribution.exhausted)
+        return f"이 밴으로 {exhausted} 선수의 관측된 챔피언 풀이 모두 막힙니다."
+    if code == "main_pick_only_in_combination":
+        return ("단독으로는 더 강한 대체픽으로 옮겨갈 수 있지만, 추천 조합에서는 그 대체픽까지 "
+                "함께 차단해 챔피언 풀 압박 효과가 커집니다.")
+    if code == "weak_solo_strong_combination":
+        return (f"단독 차단 효과는 크지 않지만, {partner} 밴과 함께 적용하면 위험한 대체픽까지 "
+                "차단해 전체 위협을 크게 낮춥니다.")
+    if code == "combination_synergy":
+        return f"{partner} 밴과 함께 적용하면 대체픽까지 막혀 단독 밴보다 효과가 커집니다."
+    if code == "low_pick_high_threat":
+        return "픽 비중은 낮지만 잡았을 때 위험도가 높은 대체픽이라, 미리 잘라내는 효과가 큽니다."
+    if code == "multi_player":
+        return f"{len(attribution.contributors)}명의 선수에게 동시에 영향을 줘 한 번의 밴으로 여러 위협을 함께 낮춥니다."
+    if code == "small_but_best_available":
+        return "추가 효과 자체는 크지 않지만, 앞선 밴들과 겹치지 않아 현재 조합에서는 이 선택이 최선입니다."
+    if code == "single_player":
+        return f"밴 효과가 {top} 선수 한 명에게 집중됩니다."
+    if code == "redistribution":
+        return ("이 밴만 따로 보면 픽이 더 위험한 챔피언으로 옮겨갈 수 있어, "
+                "세 밴을 함께 적용할 때만 의미가 있습니다.")
+    # Unknown codes must never break the report; log and fall back generically.
+    logger.warning("Unhandled ban reason code: %s", code)
+    return "추천 밴 조합 전체에서 상대의 챔피언 선택을 제한합니다."
+
+
+def _reason(attribution: BanAttribution | None) -> str:
+    """Up to two sentences explaining this ban's actual marginal contribution."""
+    if attribution is None or not attribution.reasons:
+        return "추천 밴 조합 전체에서 상대의 챔피언 선택을 제한합니다."
+    # One sentence per code, and ban_reasons caps the codes at two.
+    return " ".join(_reason_sentence(code, attribution) for code in attribution.reasons)
 
 
 def render_summary_page(result: Recommendation) -> discord.Embed:
@@ -348,8 +406,13 @@ def render_summary_page(result: Recommendation) -> discord.Embed:
                 for index, impact in enumerate(result.recommended, 1)])
     embed.add_field(name="예상 상대 위협 감소", value=f"{result.threat_reduction:.1%}", inline=True)
     embed.add_field(name="추천 안정성", value=stability_label(result), inline=True)
-    _add_blocks(embed, "왜 이 밴인가?", [f"{_champion_label(impact.champion_id, impact.name)} · {_reason(result, impact)}"
-                for impact in result.recommended])
+    # Attribution re-evaluates the model to explain B*; it never changes it.
+    attributions = attribute_bans(result)
+    _add_blocks(embed, "왜 이 밴인가?", [
+        f"**{_champion_label(impact.champion_id, impact.name)}**\n"
+        f"{_reason(attributions.get(impact.champion_id))}"
+        for impact in result.recommended
+    ])
     _add_blocks(embed, "추가 고려 4~8위", [_ban_line(result, impact, index)
                 for index, impact in enumerate(result.also_consider[:5], 4)] or ["추가 고려할 챔피언이 없습니다."])
     embed.add_field(name="영향도 안내", value="추천 밴은 각 밴을 제외했을 때의 차이입니다. "

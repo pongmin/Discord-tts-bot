@@ -203,9 +203,26 @@ marginal contribution은 전부 이 새 `r`을 그대로 쓰므로 최적 밴 �
 추가로 포함시킵니다 - 그러지 않으면 Dependency가 있어도 그 챔피언 자체가
 탐색되지 않아 무의미해집니다.
 
-종합 페이지의 "왜 이 밴인가?"는 `P_personal >= 0.7`이면 "압도적인 모스트 픽",
-`>= 0.5`면 "주력 픽 의존도가 높음"으로 표시합니다(`P_final`이 아니라
-`P_personal` 기준 - 이유는 위와 동일). 선수 상세 페이지에는 챔피언별
+종합 페이지의 "왜 이 밴인가?"는 `ban_attribution.py`에서 계산합니다. 추천 밴
+`c`마다 최적해 `B*`와 `B* - {c}`를 실제로 다시 평가해서, 선수 i별 기여를
+로그 공간에서 분해합니다:
+
+```
+total_delta_i = w_i * (log r_i(B* - {c}) - log r_i(B*))
+perf_delta_i  = w_i * (log r_perf_i(B* - {c}) - log r_perf_i(B*))
+dep_delta_i   = w_i * (log D_i(B* - {c})      - log D_i(B*))
+```
+
+`r = r_perf * D`이므로 `total = perf + dep`이 정확히 성립하고, 다섯 명을
+합하면 optimizer가 표시하는 marginal contribution과 같은 값(로그 스케일)이
+됩니다. 여기에 단독 밴 효과(`solo_delta = -log V_0({c})`)와 추천 밴끼리의
+조합 이득(`partner_gain`)을 더해, performance 중심 / dependency 중심 / 혼합 /
+여러 선수 분산 / 한 선수 집중 / 낮은 픽률 고위험 대체픽 / 조합 시너지 /
+단독은 약하지만 조합에서 강함 / 모스트지만 조합에서만 가치 있음 / 관측 풀
+소진 / 추가 효과는 작지만 현재 조합에서 최선 중 최대 2개를 골라 한국어
+문장으로 만듭니다. `P_personal >= 0.7` 같은 값은 이유 판정이 아니라 문장
+표현(예: "사실상 원챔")을 고르는 재료로만 씁니다. 이 레이어는 설명 전용이라
+`B*`·순서·점수는 전혀 바꾸지 않습니다. 선수 상세 페이지에는 챔피언별
 숫자 표시를 추가하지 않았고, 기존 주력 집중도(Top1/Top3)를 그대로 씁니다.
 
 Dependency 전용 테스트: `python -m unittest tests.test_ban_dependency -v`

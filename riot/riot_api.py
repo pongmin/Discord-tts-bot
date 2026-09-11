@@ -1,8 +1,15 @@
+import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from urllib.parse import quote
 
+import aiohttp
+
 from http_session import get_session
+
+
+logger = logging.getLogger(__name__)
 
 
 # Riot ID -> PUUID 조회는 지역 라우팅(대륙) 값을 씀
@@ -60,6 +67,14 @@ ALLOWED_SCOUTING_QUEUE_IDS: dict[int, str] = {
 # 유효한 RIOT_API_KEY가 없어서 라이브 호출로 재확인하지는 못함.
 MATCH_IDS_PAGE_SIZE = 100
 
+# 매치 수집 요청(Match-V5)의 일시적 실패에 대한 재시도 정책.
+# 429/5xx/네트워크 오류는 같은 URL을 최대 이 횟수만큼 시도함.
+# 401/403(키 문제)이나 404 같은 확정적인 응답은 재시도하지 않음 - 다시 물어봐도 답이 같음.
+MATCH_FETCH_MAX_ATTEMPTS = 3
+
+# Retry-After 헤더가 없을 때 쓰는 재시도 대기 시간(초). 시도할 때마다 선형으로 늘림.
+MATCH_FETCH_BACKOFF_SECONDS = 2
+
 
 class RiotApiError(Exception):
     """Riot API 관련 오류의 기본 클래스"""
@@ -91,6 +106,14 @@ class RateLimitedError(RiotApiError):
     def __init__(self, retry_after: int | None = None):
         self.retry_after = retry_after
         super().__init__("Riot API 요청 한도를 초과했습니다.")
+
+
+class RiotNetworkError(RiotApiError):
+    """연결 실패/타임아웃 등 응답 자체를 받지 못한 경우.
+
+    aiohttp의 예외를 그대로 흘려보내지 않고 이 타입으로 감싸서, 호출부가
+    다른 Riot API 실패와 똑같이(재시도 가능한 일시적 실패로) 다룰 수 있게 함.
+    """
 
 
 class RiotServerError(RiotApiError):
@@ -183,6 +206,36 @@ async def _request_json(url: str):
         raise RiotApiError(f"Riot API 요청이 실패했습니다. (HTTP {response.status})")
 
 
+async def _request_json_with_retry(url: str, max_attempts: int = MATCH_FETCH_MAX_ATTEMPTS):
+    """일시적 실패(429/5xx/네트워크)만 재시도하는 _request_json 래퍼.
+
+    429는 Retry-After 헤더를 그대로 지킴(없으면 선형 백오프). 재시도를 다 쓰면
+    마지막 예외를 그대로 올려서, 호출부가 원인별로(429/5xx/네트워크) 분류할 수
+    있게 함. 확정적인 응답(401/403/404/기타 4xx)은 여기서 재시도하지 않고
+    즉시 통과시킴.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await _request_json(url)
+
+        except (RateLimitedError, RiotServerError) as exc:
+            last_error = exc
+            retry_after = getattr(exc, "retry_after", None)
+            delay = retry_after if retry_after is not None else MATCH_FETCH_BACKOFF_SECONDS * attempt
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last_error = RiotNetworkError(f"Riot API 연결에 실패했습니다. ({type(exc).__name__})")
+            delay = MATCH_FETCH_BACKOFF_SECONDS * attempt
+
+        if attempt == max_attempts:
+            raise last_error
+
+        logger.warning(
+            "Riot API 재시도 %d/%d (%ss 대기): %s", attempt, max_attempts, delay, last_error
+        )
+        await asyncio.sleep(delay)
+
+
 async def get_account_by_riot_id(game_name: str, tag_line: str) -> RiotAccount:
     url = f"{ACCOUNT_BASE_URL}/accounts/by-riot-id/{quote(game_name)}/{quote(tag_line)}"
     data = await _request_json(url)
@@ -255,7 +308,7 @@ async def get_match_ids_by_queue(puuid: str, queue_id: int, count: int = 200) ->
             f"{MATCH_BASE_URL}/matches/by-puuid/{puuid}/ids"
             f"?start={start}&count={page_size}&queue={queue_id}"
         )
-        page = await _request_json(url)
+        page = await _request_json_with_retry(url)
 
         if not page:
             break
@@ -277,7 +330,7 @@ async def get_match_by_id(match_id: str) -> dict:
     필드를 버리지 않고 그대로 저장해야 나중에 다시 계산할 수 있기 때문.
     """
     url = f"{MATCH_BASE_URL}/matches/{match_id}"
-    data = await _request_json(url)
+    data = await _request_json_with_retry(url)
 
     if data is None:
         raise MatchNotFoundError(f"매치를 찾을 수 없습니다: {match_id}")

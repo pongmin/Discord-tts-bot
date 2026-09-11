@@ -19,7 +19,7 @@ from discord import app_commands
 from clash.clash_commands import fetch_clash_roster
 from scouting.ban_algorithm import Recommendation, recommend_bans, format_recommendation
 from scouting.ban_report_assets import load_player_presentations
-from scouting.ban_report_ui import LAST_PAGE_INDEX, ScoutingReportView
+from scouting.ban_report_ui import COLLECTION_WARNING_PREFIX, LAST_PAGE_INDEX, ScoutingReportView
 from scouting.match_collector import collect_player_matches
 from riot.riot_api import (
     parse_riot_id, get_account_by_riot_id, get_league_entries,
@@ -45,6 +45,11 @@ QUEUE_LABELS = {420: "솔로 랭크", 400: "일반 드래프트"}
 # normal/deep follow the measured ~9 min/200-game rate; quick is a rough fraction.
 DEPTH_CAPS = {"quick": 30, "normal": 100, "deep": 200}
 LOW_ROLE_GAME_COUNT = 20  # Advisory placeholder only; never a collection target.
+# Collection tolerance: a handful of unreachable matches must not sink a whole
+# team's recommendation. A queue is usable once this share of the matches Riot
+# listed is actually stored; the rest is reported as a warning, not an error.
+# Below it, too much of the player's history is missing to rank them honestly.
+MIN_COLLECTION_RATIO = 0.8
 RANK_CACHE_MS = 24 * 60 * 60 * 1000
 # No longer bounded by Discord's 15-minute interaction token (the job reports
 # through a plain channel message instead of a followup) - this is now just a
@@ -138,10 +143,34 @@ async def _ensure_solo_rank(conn, player_id: int, account) -> None:
     conn.commit()
 
 
+def _collection_summary(result: dict) -> tuple[int, int, int, int, str]:
+    """(requested, secured, failed, skipped, user-facing summary) for one queue.
+
+    Every listed match ends up in exactly one bucket - stored (freshly fetched
+    or already cached), transiently failed, or permanently skipped - so what is
+    actually secured is simply what is left after the other two.
+    """
+    requested = result.get("requested", 0)
+    failed = result.get("failed", 0)
+    skipped = result.get("permanently_skipped", 0)
+    secured = max(requested - failed - skipped, 0)
+    parts = [f"{requested}경기 중 {secured}경기 확보"]
+    if failed:
+        parts.append(f"{failed}경기 조회 실패")
+    if skipped:
+        parts.append(f"{skipped}경기 조회 불가(영구 제외)")
+    return requested, secured, failed, skipped, " · ".join(parts)
+
+
 async def prepare_opponents(
     inputs: dict[str, str], progress, depth: str = "normal",
-) -> list[tuple[int, str]]:
+) -> tuple[list[tuple[int, str]], list[str]]:
     """Resolve, collect and rank all five opponents.
+
+    Returns the opponents and any collection warnings, which are surfaced with
+    the report rather than aborting it: collection is tolerant of a few matches
+    Riot will not hand over, and only stops when too little of a player's
+    history could be secured (or when the failure is fatal for every request).
 
     `progress(message, role=..., done=...)` reports both the stage text (used
     verbatim in failure messages) and, where a stage belongs to one player,
@@ -166,6 +195,7 @@ async def prepare_opponents(
         resolved.append((role, label, account))
 
     opponents = []
+    warnings: list[str] = []
     with closing(db.get_connection()) as conn:
         db.init_db(conn)
         collection_cutoff = db.now_ms()
@@ -189,12 +219,23 @@ async def prepare_opponents(
                     account.puuid, account.game_name, account.tag_line,
                     queue_id=queue_id, max_count=cap, conn=conn,
                 )
-                if result["failed"] or result["aborted"] or not result["is_complete"]:
+                requested, secured, failed, skipped, summary = _collection_summary(result)
+                where = f"{ROLE_LABELS[role]} {QUEUE_LABELS[queue_id]} ({label})"
+                if result["aborted"]:
                     db.refresh_fetch_state(conn, player_id, queue_id, False)
                     raise BanCommandError(
-                        f"{ROLE_LABELS[role]} 수집 실패 ({label}, {QUEUE_LABELS[queue_id]}): "
-                        f"경기 수집을 완료하지 못했습니다. 오류 {result['failed']}건. 추천을 중단합니다."
+                        f"{where} 수집 중단: API 키가 유효하지 않아 이후 요청도 모두 실패합니다. "
+                        f"{summary}. 추천을 중단합니다."
                     )
+                # A single unreachable match no longer stops the pipeline; only
+                # losing most of the queue does.
+                if requested and secured / requested < MIN_COLLECTION_RATIO:
+                    db.refresh_fetch_state(conn, player_id, queue_id, False)
+                    raise BanCommandError(
+                        f"{where} 수집 실패: {summary}. 확보한 경기가 너무 적어 추천을 중단합니다."
+                    )
+                if failed or skipped:
+                    warnings.append(f"{COLLECTION_WARNING_PREFIX}{where}: {summary}")
                 if result["player_id"] != player_id:
                     raise BanCommandError(f"{ROLE_LABELS[role]} 수집 계정 불일치 ({label}). 추천을 중단합니다.")
             await progress(f"{ROLE_LABELS[role]} 솔로 랭크 확보 ({label})", role=role)
@@ -209,12 +250,15 @@ async def prepare_opponents(
             # matches, rank, and a non-empty role history.
             await progress(f"{ROLE_LABELS[role]} 수집 완료 ({label})", role=role, done=True)
             opponents.append((player_id, role.upper()))
-    return opponents
+    return opponents, warnings
 
 
-def _recommendation(repo: ScoutingRepo, opponents: list[tuple[int, str]]) -> Recommendation:
+def _recommendation(
+    repo: ScoutingRepo, opponents: list[tuple[int, str]],
+    collection_warnings: tuple[str, ...] = (),
+) -> Recommendation:
     result = recommend_bans(repo, opponents)
-    warnings = []
+    warnings = list(collection_warnings)
     for player in result.players:
         count = sum(champion.games for champion in player.champions.values())
         if count < LOW_ROLE_GAME_COUNT:
@@ -233,7 +277,10 @@ def _recommend_report(opponents: list[tuple[int, str]]) -> str:
         return format_recommendation(_recommendation(repo, opponents))
 
 
-def _build_discord_report(opponents: list[tuple[int, str]], cutoff_time: int):
+def _build_discord_report(
+    opponents: list[tuple[int, str]], cutoff_time: int,
+    collection_warnings: tuple[str, ...] = (),
+):
     """
     cutoff_time을 명시적으로 받음(호출부가 db.now_ms()를 흘려 넣던 것에서 변경) -
     버튼으로 리포트를 다시 그릴 때(재시작 후 복구 포함) 처음 만들 때와 정확히
@@ -243,7 +290,7 @@ def _build_discord_report(opponents: list[tuple[int, str]], cutoff_time: int):
     # Create/use/close SQLite on the worker thread. Presentation-only metadata
     # reads reuse the same cutoff and never add API calls or change collection.
     with ScoutingRepo(cutoff_time=cutoff_time) as repo:
-        result = _recommendation(repo, opponents)
+        result = _recommendation(repo, opponents, collection_warnings)
         return result, load_player_presentations(repo, result)
 
 
@@ -440,7 +487,7 @@ async def _run_banrecommend_job(
             # write connections on this thread or a write here racing a
             # different team's read connection on its worker thread.
             async with scouting_db_lock:
-                opponents = await prepare_opponents(inputs, progress, depth)
+                opponents, collection_warnings = await prepare_opponents(inputs, progress, depth)
                 await progress("밴 계산 중")
                 await status.start_calculation()
                 # Captured AFTER collection finishes, not before: a freshly
@@ -448,7 +495,9 @@ async def _run_banrecommend_job(
                 # earlier, which would make build_player_model see "no games
                 # before cutoff" and drop a player who was just collected.
                 cutoff_time = db.now_ms()
-                result, presentations = await asyncio.to_thread(_build_discord_report, opponents, cutoff_time)
+                result, presentations = await asyncio.to_thread(
+                    _build_discord_report, opponents, cutoff_time, tuple(collection_warnings)
+                )
     except TimeoutError:
         await status.fail(job.stage)
         await channel.send(

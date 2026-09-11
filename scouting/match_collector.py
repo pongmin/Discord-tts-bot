@@ -10,6 +10,11 @@ player_matches에 채워 넣음(수집을 요청한 선수만이 아니라).
 - 이미 원본 파일 + matches 색인이 둘 다 있는 매치는 다시 내려받지 않음.
 - 매치 ID 목록만 다시 받고, 실제로 없는 것만 상세 조회함.
 - 실패는 fetch_failures에 남기고, 재시도 가능 여부(retryable)를 구분함.
+- 일시적 실패(429/5xx/네트워크)는 riot_api 쪽에서 같은 요청을 정해진 횟수만큼
+  재시도함. 그래도 안 되면 이번 실행에서만 실패로 세고 다음 매치로 넘어감.
+- 확정적인 실패(404/큐 불일치/참가자 불일치)는 영구 스킵으로 표시해서, 다음
+  실행에서 다시 요청하지 않고 "처리 완료"로 취급함. 매치 한 건 때문에 그 선수의
+  수집이 영원히 미완성으로 남지 않게 하기 위함.
 """
 
 import asyncio
@@ -23,6 +28,7 @@ from riot.riot_api import (
     InvalidApiKeyError,
     RateLimitedError,
     RiotServerError,
+    RiotNetworkError,
     MatchNotFoundError,
 )
 from scouting.match_position import derive_canonical_role, is_role_mismatch
@@ -33,7 +39,8 @@ from scouting import scouting_db as db
 # Riot 개인 개발자 키 기준 요청 간 최소 간격(초). 너무 빠르게 쏘면 429가 남.
 DEFAULT_REQUEST_DELAY = 1.2
 
-# 429를 받았을 때 Retry-After가 없으면 대신 쓰는 대기 시간(초)
+# 재시도를 다 쓰고도 429가 났을 때, 다음 매치로 넘어가기 전에 쉬는 시간(초).
+# Retry-After가 있으면 그 값을 씀. (요청 자체의 재시도/대기는 riot_api가 담당)
 DEFAULT_RATE_LIMIT_BACKOFF = 5
 
 
@@ -147,6 +154,16 @@ def _store_match(conn, puuid: str, match_id: str, raw_data: dict) -> bool:
     return True
 
 
+def _skip_permanently(conn, match_id: str, message: str, status_code: int | None = None) -> None:
+    """다시 받아도 결과가 같은 매치를 영구 스킵으로 표시함.
+
+    fetch_failures에 남겨두면 다음 실행에서 이 매치를 아예 요청하지 않고,
+    수집 완료 판정에서도 "처리됨"으로 세어 그 선수의 수집이 이 매치 하나
+    때문에 영원히 미완성으로 남지 않게 함.
+    """
+    db.record_permanent_skip(conn, match_id, message, status_code=status_code)
+
+
 def _ensure_player_match_from_cache(conn, player_id: int, puuid: str, match_id: str) -> None:
     """
     matches/raw 파일은 이미 있는데(다른 선수 수집 때 받았을 수 있음)
@@ -194,13 +211,21 @@ async def collect_player_matches(
 
         newly_fetched = 0
         skipped_cached = 0
+        permanently_skipped = 0
         failed = 0
         aborted = False
+        permanent_skips = db.get_permanent_skip_match_ids(conn)
 
         for match_id in match_ids:
             if db.has_cached_match(conn, match_id):
                 _ensure_player_match_from_cache(conn, player_id, puuid, match_id)
                 skipped_cached += 1
+                continue
+
+            # 지난 실행에서 이미 "다시 받아도 소용없음"으로 판정된 매치.
+            # 다시 요청하지 않고, 미완성으로 남기지도 않음.
+            if match_id in permanent_skips:
+                permanently_skipped += 1
                 continue
 
             try:
@@ -213,6 +238,7 @@ async def collect_player_matches(
                 break
 
             except RateLimitedError as e:
+                # riot_api에서 Retry-After를 지키며 재시도한 뒤에도 계속 429인 경우.
                 db.record_failure(
                     conn, "match_by_id", retryable=True, match_id=match_id,
                     status_code=e.status_code, message=str(e)
@@ -221,35 +247,42 @@ async def collect_player_matches(
                 await asyncio.sleep(e.retry_after or DEFAULT_RATE_LIMIT_BACKOFF)
                 continue
 
-            except RiotServerError as e:
+            except (RiotServerError, RiotNetworkError) as e:
+                # 서버 오류/연결 실패도 재시도를 이미 다 쓴 상태. 다음 실행에서
+                # 다시 시도할 수 있게 retryable로 남기고 이번 매치만 건너뜀.
                 db.record_failure(
                     conn, "match_by_id", retryable=True, match_id=match_id,
-                    status_code=e.status_code, message=str(e)
+                    status_code=getattr(e, "status_code", None), message=str(e)
                 )
                 failed += 1
                 continue
 
             except MatchNotFoundError as e:
                 # 매치가 삭제됐거나 접근 불가한 경우. 재시도해도 소용없음.
-                db.record_failure(conn, "match_by_id", retryable=False, match_id=match_id, message=str(e))
-                failed += 1
+                _skip_permanently(conn, match_id, str(e), status_code=404)
+                permanent_skips.add(match_id)
+                permanently_skipped += 1
                 continue
 
             except RiotApiError as e:
+                # 분류되지 않은 API 오류. 원인을 모르니 영구 스킵으로 못 박지 않고
+                # 이번 실행의 실패로만 셈.
                 db.record_failure(conn, "match_by_id", retryable=False, match_id=match_id, message=str(e))
                 failed += 1
                 continue
 
             # 요청한 큐가 아닌 매치가 섞여 들어오면(API 오동작, 이벤트/아레나 큐 유입 등)
-            # 절대 저장하지 않고 건너뜀 - by-puuid/ids의 queue 필터를 무조건 신뢰하지 않음
+            # 절대 저장하지 않고 건너뜀 - by-puuid/ids의 queue 필터를 무조건 신뢰하지 않음.
+            # 이 매치의 큐는 바뀌지 않으므로 영구 스킵.
             actual_queue_id = (match_data.get("info") or {}).get("queueId")
 
             if actual_queue_id != queue_id:
-                db.record_failure(
-                    conn, "match_by_id", retryable=False, match_id=match_id,
-                    message=f"요청한 큐({queue_id})와 실제 매치 큐({actual_queue_id})가 다름 - 저장 안 함"
+                _skip_permanently(
+                    conn, match_id,
+                    f"요청한 큐({queue_id})와 실제 매치 큐({actual_queue_id})가 다름 - 저장 안 함",
                 )
-                failed += 1
+                permanent_skips.add(match_id)
+                permanently_skipped += 1
                 await asyncio.sleep(request_delay)
                 continue
 
@@ -258,15 +291,20 @@ async def collect_player_matches(
             if stored:
                 newly_fetched += 1
             else:
-                db.record_failure(
-                    conn, "match_by_id", retryable=False, match_id=match_id,
-                    message="참가자 목록에서 이 puuid를 찾을 수 없음"
-                )
-                failed += 1
+                # 이 매치의 참가자 목록에는 이 puuid가 없음 - 다시 받아도 같음.
+                _skip_permanently(conn, match_id, "참가자 목록에서 이 puuid를 찾을 수 없음")
+                permanent_skips.add(match_id)
+                permanently_skipped += 1
 
             await asyncio.sleep(request_delay)
 
-        cached_count = sum(1 for match_id in match_ids if db.has_cached_match(conn, match_id))
+        # "완료"의 의미: 요청한 매치가 전부 결말이 난 상태. 저장됨(신규/캐시)이거나,
+        # 다시 받아봐야 소용없다고 판정돼 영구 스킵된 것까지 처리 완료로 봄.
+        # 일시적 실패(429/5xx/네트워크)만 미완성으로 남아 다음 실행이 이어받음.
+        cached_count = sum(
+            1 for match_id in match_ids
+            if db.has_cached_match(conn, match_id) or match_id in permanent_skips
+        )
         is_complete = (not aborted) and cached_count == len(match_ids)
 
         db.refresh_fetch_state(conn, player_id, queue_id, is_complete)
@@ -276,6 +314,7 @@ async def collect_player_matches(
             "requested": len(match_ids),
             "newly_fetched": newly_fetched,
             "skipped_cached": skipped_cached,
+            "permanently_skipped": permanently_skipped,
             "failed": failed,
             "aborted": aborted,
             "is_complete": is_complete,

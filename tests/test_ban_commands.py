@@ -81,7 +81,11 @@ class ScoutingCommandFixture(unittest.IsolatedAsyncioTestCase):
             )
         db.touch_fetch_attempt(conn, player_id, queue_id)
         db.refresh_fetch_state(conn, player_id, queue_id, True)
-        return dict(player_id=player_id, failed=0, aborted=False, is_complete=True)
+        return dict(
+            player_id=player_id, requested=max_count, newly_fetched=max_count,
+            skipped_cached=0, permanently_skipped=0, failed=0,
+            aborted=False, is_complete=True,
+        )
 
     def _bot_with_ban_commands(self):
         bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
@@ -120,14 +124,15 @@ class ScoutingCommandFixture(unittest.IsolatedAsyncioTestCase):
 class BanCommandTests(ScoutingCommandFixture):
     async def test_success_roles_cache_and_real_algorithm(self):
         before = hashlib.sha256(Path("scouting/ban_algorithm.py").read_bytes()).digest()
-        opponents = await command.prepare_opponents(self.inputs, self.progress)
+        opponents, warnings = await command.prepare_opponents(self.inputs, self.progress)
+        self.assertEqual(warnings, [])
         self.assertEqual([role for _, role in opponents], [r.upper() for r in command.ROLE_INPUTS])
         self.assertEqual(self.collect.await_count, 10)
         self.assertEqual(self.ranks.await_count, 5)
         self.assertEqual({c.kwargs["queue_id"] for c in self.collect.await_args_list}, {420, 400})
         self.collect.reset_mock()
         self.ranks.reset_mock()
-        self.assertEqual(await command.prepare_opponents(self.inputs, self.progress), opponents)
+        self.assertEqual((await command.prepare_opponents(self.inputs, self.progress))[0], opponents)
         self.collect.assert_not_awaited()
         self.ranks.assert_not_awaited()
         # Exercise the real unchanged algorithm and real repo in its worker thread.
@@ -152,22 +157,55 @@ class BanCommandTests(ScoutingCommandFixture):
             await command.prepare_opponents(self.inputs, self.progress)
         self.collect.assert_not_awaited()
 
-    async def test_all_partial_failure_signals_stop(self):
-        for flags in (
-            dict(failed=1, aborted=False, is_complete=True),
-            dict(failed=0, aborted=True, is_complete=False),
-            dict(failed=0, aborted=False, is_complete=False),
+    async def test_fatal_and_too_thin_collection_still_stop(self):
+        # An invalid key dooms every following request, and losing most of a
+        # queue leaves too little history to rank the player honestly.
+        for flags, expected in (
+            (dict(requested=100, failed=100, aborted=True, is_complete=False), "수집 중단.*API 키"),
+            (dict(requested=100, failed=50, aborted=False, is_complete=False), "수집 실패.*100경기 중 50경기 확보"),
+            (dict(requested=100, permanently_skipped=90, aborted=False, is_complete=True), "수집 실패.*90경기 조회 불가"),
         ):
             with self.subTest(flags=flags):
                 self.collect.side_effect = None
                 self.collect.return_value = dict(player_id=1, **flags)
-                with self.assertRaisesRegex(command.BanCommandError, "TOP 수집 실패.*Player0#TEST.*솔로 랭크"):
+                with self.assertRaisesRegex(command.BanCommandError, f"TOP 솔로 랭크.*Player0#TEST.*{expected}"):
                     await command.prepare_opponents(self.inputs, self.progress)
                 self.ranks.assert_not_awaited()
 
+    async def test_partial_failure_warns_and_keeps_going(self):
+        """A couple of unreachable matches per queue must not sink the team."""
+        async def partial(puuid, name, tag, *, queue_id, max_count, conn):
+            result = await self.collect_success(puuid, name, tag, queue_id=queue_id, max_count=max_count, conn=conn)
+            # 100 listed, 98 stored: one transient failure, one permanent skip.
+            return result | dict(
+                requested=max_count, newly_fetched=max_count - 2,
+                failed=1, permanently_skipped=1, is_complete=False,
+            )
+
+        self.collect.side_effect = partial
+        opponents, warnings = await command.prepare_opponents(self.inputs, self.progress)
+        self.assertEqual([role for _, role in opponents], [r.upper() for r in command.ROLE_INPUTS])
+        self.assertEqual(len(warnings), 10)
+        self.assertIn(
+            f"{command.COLLECTION_WARNING_PREFIX}TOP 솔로 랭크 (Player0#TEST): "
+            "100경기 중 98경기 확보 · 1경기 조회 실패 · 1경기 조회 불가(영구 제외)",
+            warnings,
+        )
+        # The warning reaches the user verbatim, not as an untranslated stub.
+        from scouting.ban_report_ui import _translated_warning
+        self.assertEqual(
+            _translated_warning(warnings[0]), warnings[0].removeprefix(command.COLLECTION_WARNING_PREFIX)
+        )
+        report = await asyncio.to_thread(
+            command._build_discord_report, opponents, db.now_ms(), tuple(warnings)
+        )
+        self.assertTrue(any("100경기 중 98경기 확보" in note for note in report[0].warnings))
+
     async def test_missing_role_data_is_explicit(self):
         self.collect.side_effect = None
-        self.collect.return_value = dict(player_id=1, failed=0, aborted=False, is_complete=True)
+        self.collect.return_value = dict(
+            player_id=1, requested=0, failed=0, permanently_skipped=0, aborted=False, is_complete=True
+        )
         with self.assertRaisesRegex(command.BanCommandError, "TOP 데이터 부족.*Player0#TEST"):
             await command.prepare_opponents(self.inputs, self.progress)
 
@@ -387,7 +425,7 @@ class BanCommandTests(ScoutingCommandFixture):
         for depth, cap in (("quick", 30), ("normal", 100), ("deep", 200)):
             with self.subTest(depth=depth):
                 self.collect.reset_mock()
-                opponents = await command.prepare_opponents(self.inputs, self.progress, depth)
+                opponents, _ = await command.prepare_opponents(self.inputs, self.progress, depth)
                 self.assertEqual(self.collect.await_count, 10)
                 self.assertEqual({c.kwargs["max_count"] for c in self.collect.await_args_list}, {cap})
                 # Even stale/incomplete fetch metadata must not override enough
@@ -431,7 +469,7 @@ class BanCommandTests(ScoutingCommandFixture):
 
     async def test_short_history_warns_without_failing_or_forcing_deeper_fetch(self):
         self.games_per_fetch = 1
-        opponents = await command.prepare_opponents(self.inputs, self.progress, "deep")
+        opponents, _ = await command.prepare_opponents(self.inputs, self.progress, "deep")
         self.assertEqual(self.collect.await_count, 10)
         report = await asyncio.to_thread(command._recommend_report, opponents)
         self.assertIn("Player0#TEST/TOP: only 2 role-filtered games available", report)

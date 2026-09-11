@@ -85,7 +85,8 @@ async def _run(riot_id: str, queue_ids: list[int], max_count: int, request_delay
 
         print(
             f"요청 {result['requested']}개 / 신규 {result['newly_fetched']}개 / "
-            f"캐시에서 재사용 {result['skipped_cached']}개 / 실패 {result['failed']}개"
+            f"캐시에서 재사용 {result['skipped_cached']}개 / "
+            f"영구 제외 {result['permanently_skipped']}개 / 실패 {result['failed']}개"
         )
 
         if result["aborted"]:
@@ -95,7 +96,7 @@ async def _run(riot_id: str, queue_ids: list[int], max_count: int, request_delay
         elif result["is_complete"]:
             print("이 큐에 대한 수집 완료.")
         else:
-            print("일부만 수집됨. 다시 실행하면 이 큐는 남은 부분부터 이어서 받음.")
+            print("일부만 수집됨(일시적 실패). 다시 실행하면 이 큐는 남은 부분부터 이어서 받음.")
 
 
 def main() -> None:

@@ -584,6 +584,12 @@ def get_latest_rank_snapshot(
     return conn.execute(query, params).fetchone()
 
 
+# 재요청해도 결과가 달라지지 않는 매치(삭제됨/큐 불일치/참가자 불일치)를
+# 남기는 endpoint 라벨. fetch_failures 테이블을 그대로 쓰되, 일시적 실패 기록과
+# 섞이지 않도록 라벨로만 구분함(스키마 변경 없음).
+PERMANENT_SKIP_ENDPOINT = "match_by_id:permanent_skip"
+
+
 def record_failure(
     conn: sqlite3.Connection,
     endpoint: str,
@@ -600,6 +606,40 @@ def record_failure(
         (endpoint, match_id, status_code, now_ms(), int(retryable), message)
     )
     conn.commit()
+
+
+def record_permanent_skip(
+    conn: sqlite3.Connection, match_id: str, message: str, status_code: int | None = None
+) -> None:
+    """이 매치는 앞으로 다시 내려받지 않음으로 표시함.
+
+    같은 매치를 두 번 표시해도 행이 늘어나지 않게 이미 있으면 아무것도 하지 않음.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM fetch_failures WHERE endpoint = ? AND match_id = ?",
+        (PERMANENT_SKIP_ENDPOINT, match_id)
+    ).fetchone()
+
+    if row is not None:
+        return
+
+    record_failure(
+        conn, PERMANENT_SKIP_ENDPOINT, retryable=False,
+        match_id=match_id, status_code=status_code, message=message,
+    )
+
+
+def get_permanent_skip_match_ids(conn: sqlite3.Connection) -> set[str]:
+    """영구 스킵으로 표시된 매치 ID 전체.
+
+    재실행 때 같은 404/큐 불일치 매치를 매번 다시 요청하지 않게 하려고 씀.
+    """
+    return {
+        row["match_id"] for row in conn.execute(
+            "SELECT match_id FROM fetch_failures WHERE endpoint = ? AND match_id IS NOT NULL",
+            (PERMANENT_SKIP_ENDPOINT,)
+        )
+    }
 
 
 # =========================

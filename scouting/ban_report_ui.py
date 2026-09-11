@@ -181,6 +181,11 @@ def stability_label(result: Recommendation) -> str:
     return "보통" if len(set.intersection(*sets)) >= 2 else "낮음"
 
 
+# 수집 경고는 이미 사람이 읽을 한국어 문장이라 번역 테이블을 타지 않고
+# 이 접두사만 떼고 그대로 보여줌(ban_commands가 붙여서 넘김).
+COLLECTION_WARNING_PREFIX = "collection: "
+
+
 def _warning_owner(result: Recommendation, warning: str) -> PlayerModel | None:
     for player in result.players:
         if warning.startswith((f"{player.label}/{player.role}:", f"{player.label}:")):
@@ -189,6 +194,8 @@ def _warning_owner(result: Recommendation, warning: str) -> PlayerModel | None:
 
 
 def _translated_warning(warning: str) -> str:
+    if warning.startswith(COLLECTION_WARNING_PREFIX):
+        return warning.removeprefix(COLLECTION_WARNING_PREFIX)
     if "no meta observations" in warning:
         return "포지션별 비교 기록이 없어 개인 픽 기록과 미관측 챔피언의 최소 안전 확률로 분석했습니다."
     if "no recognized solo-queue tier at cutoff" in warning:

@@ -228,10 +228,15 @@ class BanCommandTests(ScoutingCommandFixture):
 
     async def test_command_registration_shape(self):
         slash = self._bot_with_ban_commands()
-        self.assertEqual([p.name for p in slash.parameters], list(command.ROLE_INPUTS) + ["depth"])
-        self.assertTrue(all(p.required for p in slash.parameters[:5]))
+        self.assertEqual(
+            [p.name for p in slash.parameters],
+            ["team", *command.ROLE_INPUTS, "depth"],
+        )
+        # The five role slots became optional when `team` was added as the
+        # alternative way to fill them; "exactly one of the two" is enforced in
+        # the callback instead, since Discord cannot express it.
+        self.assertFalse(any(p.required for p in slash.parameters))
         depth_param = slash.parameters[-1]
-        self.assertFalse(depth_param.required)
         self.assertEqual(depth_param.default, "normal")
         self.assertEqual([c.value for c in depth_param.choices], ["quick", "normal", "deep"])
 

@@ -679,12 +679,17 @@ class PersistentBanReportRouter(discord.ui.View):
 
 
 def setup_ban_commands(bot):
+    # Imported here, not at module scope: team_commands imports this module for
+    # the shared input parser, so a top-level import would be circular.
+    from scouting.team_commands import resolve_team_or_inputs
+
     # 재시작 후에도 예전 리포트의 버튼이 동작하도록 전역으로 한 번만 등록함.
     # 로그인 전에 호출해도 되는 동기 등록이라 setup 시점에 바로 둠.
     bot.add_view(PersistentBanReportRouter())
 
     @bot.tree.command(name="banrecommend", description="상대 5명의 역할별 Riot ID로 밴 3개를 추천합니다.")
     @app_commands.describe(
+        team="저장된 팀 이름 (선수 5명 대신 · 저장 순서를 TOP→SUPPORT로 씁니다)",
         top="TOP 선수 (이름#태그)", jungle="JUNGLE 선수 (이름#태그)",
         middle="MID 선수 (이름#태그)", bottom="BOTTOM 선수 (이름#태그)",
         utility="SUPPORT 선수 (이름#태그)",
@@ -692,16 +697,25 @@ def setup_ban_commands(bot):
     )
     @app_commands.choices(depth=depth_choices())
     async def banrecommend(
-        interaction: discord.Interaction, top: str, jungle: str,
-        middle: str, bottom: str, utility: str,
+        interaction: discord.Interaction, team: str | None = None,
+        top: str | None = None, jungle: str | None = None,
+        middle: str | None = None, bottom: str | None = None,
+        utility: str | None = None,
         depth: str = "normal",
     ):
-        inputs = dict(zip(ROLE_INPUTS, (top, jungle, middle, bottom, utility)))
+        provided = dict(zip(ROLE_INPUTS, (top, jungle, middle, bottom, utility)))
 
-        # Immediate, no-I/O validation only: Riot ID shape and duplicate slots.
-        # Account lookups, collection, and recommendation all happen in the
-        # background job below.
+        # Immediate, no-I/O validation only: Riot ID shape and duplicate slots
+        # (plus one indexed read when a saved team is named). Account lookups,
+        # collection, and recommendation all happen in the background job below.
+        # A saved team is just an alias for the same five typed Riot IDs; unlike
+        # /assignroles this command needs roles, so the saved order is read
+        # positionally as TOP, JUNGLE, MID, BOTTOM, SUPPORT.
         try:
+            inputs = await resolve_team_or_inputs(
+                interaction.guild_id, team, provided,
+                slots=ROLE_INPUTS, labels=ROLE_LABELS,
+            )
             parsed = parse_inputs(inputs)
         except BanCommandError as exc:
             await interaction.response.send_message(f"❌ {exc}", ephemeral=True)

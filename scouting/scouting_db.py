@@ -136,6 +136,21 @@ CREATE TABLE IF NOT EXISTS rank_snapshots (
 -- 이전/다음 버튼이 계속 동작하도록(persistent view), 그 메시지를 다시 만드는 데
 -- 필요한 최소 정보(대상 팀, 컷오프, 현재 페이지)만 저장함 - Recommendation
 -- 자체는 저장하지 않고 버튼을 누를 때 opponents+cutoff_time으로 다시 계산함.
+-- 저장된 팀 = 선수 5명에 붙인 이름표일 뿐임. 스카우팅/매치 데이터는 여기 전혀
+-- 복제하지 않고, Riot ID 문자열만 들고 있다가 명령이 실행될 때 기존 파이프라인이
+-- 평소처럼 계정 조회 -> 수집 -> 캐시 재사용을 하도록 넘겨줌.
+-- team_name_key는 team_name을 casefold한 값으로, 대소문자만 다른 이름이 같은
+-- 팀으로 취급되게 하는 조회용 키임(표시에는 언제나 team_name을 씀).
+CREATE TABLE IF NOT EXISTS saved_teams (
+    guild_id INTEGER NOT NULL,
+    team_name_key TEXT NOT NULL,
+    team_name TEXT NOT NULL,
+    players_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, team_name_key)
+);
+
 CREATE TABLE IF NOT EXISTS ban_reports (
     message_id INTEGER PRIMARY KEY,
     channel_id INTEGER NOT NULL,
@@ -701,3 +716,67 @@ def update_ban_report_page(conn: sqlite3.Connection, message_id: int, page_index
 def ban_report_opponents(row: sqlite3.Row) -> list[tuple[int, str]]:
     """opponents_json을 recommend_bans()가 받는 [(player_id, role), ...] 형태로 되돌림."""
     return [(player_id, role) for player_id, role in json.loads(row["opponents_json"])]
+
+
+# =========================
+# saved_teams (Riot ID 5개에 이름을 붙여 재사용하는 용도)
+# =========================
+
+TEAM_SIZE = 5
+
+
+def _team_key(team_name: str) -> str:
+    return team_name.strip().casefold()
+
+
+def save_team(
+    conn: sqlite3.Connection, guild_id: int, team_name: str, players: list[str]
+) -> bool:
+    """팀 하나를 저장/교체함. 새로 만들었으면 True, 기존 팀을 덮어썼으면 False.
+
+    players는 "이름#태그" 문자열 5개를 등록된 순서 그대로 저장함. 선수 참조만
+    저장하고 수집 데이터는 일절 복제하지 않음.
+    """
+    if len(players) != TEAM_SIZE:
+        raise ValueError(f"저장할 팀은 정확히 {TEAM_SIZE}명이어야 함: {len(players)}명")
+    key = _team_key(team_name)
+    now = now_ms()
+    existing = get_team(conn, guild_id, team_name)
+    conn.execute(
+        """
+        INSERT INTO saved_teams (
+            guild_id, team_name_key, team_name, players_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, team_name_key) DO UPDATE SET
+            team_name = excluded.team_name,
+            players_json = excluded.players_json,
+            updated_at = excluded.updated_at
+        """,
+        (guild_id, key, team_name.strip(), json.dumps(players), now, now),
+    )
+    conn.commit()
+    return existing is None
+
+
+def get_team(conn: sqlite3.Connection, guild_id: int, team_name: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM saved_teams WHERE guild_id = ? AND team_name_key = ?",
+        (guild_id, _team_key(team_name)),
+    ).fetchone()
+
+
+def delete_team(conn: sqlite3.Connection, guild_id: int, team_name: str) -> bool:
+    """저장된 팀을 지움. 실제로 지워졌으면 True, 없던 이름이면 False."""
+    cursor = conn.execute(
+        "DELETE FROM saved_teams WHERE guild_id = ? AND team_name_key = ?",
+        (guild_id, _team_key(team_name)),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def team_players(row: sqlite3.Row) -> list[str]:
+    """players_json을 "이름#태그" 문자열 리스트로 되돌림."""
+    players = json.loads(row["players_json"])
+    return [str(player) for player in players]

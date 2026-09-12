@@ -18,6 +18,7 @@ from discord_commands import setup_commands
 from clash.clash_commands import setup_clash_commands
 from scouting.ban_commands import setup_ban_commands
 from scouting.role_commands import setup_role_commands
+from scouting.team_commands import setup_team_commands
 
 
 # =========================
@@ -177,6 +178,7 @@ setup_commands(bot, tts_channels, save_tts_channels)
 setup_clash_commands(bot)
 setup_ban_commands(bot)
 setup_role_commands(bot)
+setup_team_commands(bot)
 
 # =========================
 # 자동 반응

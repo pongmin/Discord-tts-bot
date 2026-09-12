@@ -7,7 +7,8 @@ model itself is scouting.role_assignment. This module only validates input,
 registers a background job, and renders the result.
 
 Collection happens once per player, not once per player/role - all 25 cells of
-the matrix are read back out of that single collected dataset.
+the matrix are read back out of that single collected dataset. The whole matrix
+is always computed; `details` only decides whether it is rendered.
 
 /banrecommend is untouched: recommend_bans is never called from here.
 """
@@ -24,6 +25,7 @@ from scouting.ban_commands import (
 )
 from scouting import scouting_db as db
 from scouting.role_assignment import assign_roles
+from scouting.team_commands import TEAM_NAME_MAX, resolve_team_or_inputs
 from scouting.role_assignment_ui import render_assignment_embed, render_matrix_embed
 from scouting.scouting_job_manager import ScoutingJob, scouting_db_lock, scouting_jobs
 from scouting.scouting_repo import ScoutingRepo
@@ -59,6 +61,7 @@ def _build_assignment(player_ids: list[int], cutoff_time: int):
 
 async def _run_assignroles_job(
     job: ScoutingJob, inputs: dict[str, str], depth: str, channel,
+    details: bool = False,
 ) -> None:
     """Background job body: collection + assignment, then a channel message.
 
@@ -129,12 +132,13 @@ async def _run_assignroles_job(
     await status.complete()
     for warning in collection_warnings:
         await channel.send(warning[:1900], allowed_mentions=mentions)
-    # Recommendation and evidence in one message: two embeds, no navigation
-    # state to persist and nothing to revive after a restart.
-    await channel.send(
-        embeds=[render_assignment_embed(result), render_matrix_embed(result)],
-        allowed_mentions=mentions,
-    )
+    # The answer by default; the 5x5 evidence appended only on request. Either
+    # way it is one message with no navigation state to persist and nothing to
+    # revive after a restart.
+    embeds = [render_assignment_embed(result)]
+    if details:
+        embeds.append(render_matrix_embed(result))
+    await channel.send(embeds=embeds, allowed_mentions=mentions)
 
 
 def setup_role_commands(bot):
@@ -143,21 +147,31 @@ def setup_role_commands(bot):
         description="아군 5명의 Riot ID로 포지션 배치를 추천합니다.",
     )
     @app_commands.describe(
+        team=f"저장된 팀 이름 (선수 5명 대신 · /teamregister, {TEAM_NAME_MAX}자 이하)",
         player1="선수 1 (이름#태그)", player2="선수 2 (이름#태그)",
         player3="선수 3 (이름#태그)", player4="선수 4 (이름#태그)",
         player5="선수 5 (이름#태그)",
         depth=DEPTH_DESCRIPTION,
+        details="켜면 선수×포지션 5×5 적합도 진단표를 함께 보여줍니다.",
     )
     @app_commands.choices(depth=depth_choices())
     async def assignroles(
-        interaction: discord.Interaction, player1: str, player2: str,
-        player3: str, player4: str, player5: str,
-        depth: str = "normal",
+        interaction: discord.Interaction, team: str | None = None,
+        player1: str | None = None, player2: str | None = None,
+        player3: str | None = None, player4: str | None = None,
+        player5: str | None = None,
+        depth: str = "normal", details: bool = False,
     ):
-        inputs = dict(zip(PLAYER_SLOTS, (player1, player2, player3, player4, player5)))
+        provided = dict(zip(PLAYER_SLOTS, (player1, player2, player3, player4, player5)))
 
-        # Immediate, no-I/O validation only; everything else is the job below.
+        # A saved team is only an alias: it is resolved to the same five Riot ID
+        # strings a user would have typed, and everything downstream is
+        # unchanged. The saved order carries no role meaning here.
         try:
+            inputs = await resolve_team_or_inputs(
+                interaction.guild_id, team, provided,
+                slots=PLAYER_SLOTS, labels=PLAYER_LABELS,
+            )
             parsed = parse_inputs(inputs, slots=PLAYER_SLOTS, labels=PLAYER_LABELS)
         except BanCommandError as exc:
             await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
@@ -172,7 +186,7 @@ def setup_role_commands(bot):
         channel = interaction.channel
 
         async def runner(job: ScoutingJob) -> None:
-            await _run_assignroles_job(job, inputs, depth, channel)
+            await _run_assignroles_job(job, inputs, depth, channel, details)
 
         # start() is synchronous end-to-end, so dedupe and registration happen
         # atomically for two near-simultaneous requests for the same five.

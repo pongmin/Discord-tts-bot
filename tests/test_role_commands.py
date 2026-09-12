@@ -36,10 +36,10 @@ class AssignRolesFixture(ScoutingCommandFixture):
         self.assertIsNotNone(bot.tree.get_command("clashban"))
         return bot.tree.get_command("assignroles")
 
-    async def _run_one(self):
+    async def _run_one(self, **extra):
         slash = self._assignroles_command()
         interaction, channel = self._interaction()
-        await slash.callback(interaction, **self.inputs)
+        await slash.callback(interaction, **self.inputs, **extra)
         key = command._assignment_key(
             ban_commands.parse_inputs(
                 self.inputs, slots=command.PLAYER_SLOTS, labels=command.PLAYER_LABELS
@@ -50,16 +50,19 @@ class AssignRolesFixture(ScoutingCommandFixture):
 
 
 class AssignRolesCommandTests(AssignRolesFixture):
-    async def test_registration_takes_five_players_and_the_same_depths(self):
+    async def test_registration_takes_five_players_depth_and_details(self):
         slash = self._assignroles_command()
         self.assertEqual(
             [parameter.name for parameter in slash.parameters],
-            [*command.PLAYER_SLOTS, "depth"],
+            ["team", *command.PLAYER_SLOTS, "depth", "details"],
         )
         self.assertEqual(
             [choice.value for choice in slash._params["depth"].choices],
             list(ban_commands.DEPTH_CAPS),
         )
+        details = slash._params["details"]
+        self.assertFalse(details.required)
+        self.assertIs(details.default, False)
 
     async def test_one_collection_per_player_feeds_all_five_role_cells(self):
         interaction, channel = await self._run_one()
@@ -71,18 +74,68 @@ class AssignRolesCommandTests(AssignRolesFixture):
         interaction.response.send_message.assert_awaited_once()
 
         embeds = channel.send.await_args.kwargs["embeds"]
-        self.assertEqual(len(embeds), 2)
-        assignment, matrix = embeds
+        # Default response: the answer only, no 5x5 grid.
+        self.assertEqual(len(embeds), 1)
+        assignment = embeds[0]
         # Each synthetic player mains exactly one role, so the recommendation
-        # is the identity mapping, and every player gets a diagnostic row.
+        # is the identity mapping.
         recommended = assignment.fields[0].value
         for index, role in enumerate(ROLE_ORDER):
             with self.subTest(role=role):
                 self.assertIn(f"Player{index}#TEST", recommended.splitlines()[index])
+        self.assertLessEqual(len(assignment), 6000)
+
+    async def test_the_concise_response_carries_both_scores_and_the_gap(self):
+        _, channel = await self._run_one()
+        embed = channel.send.await_args.kwargs["embeds"][0]
+
+        names = [field.name for field in embed.fields]
+        self.assertEqual(names[:3], ["추천 배치", "점수", "차선 배치"])
+        scores = dict(zip(names, (field.value for field in embed.fields)))["점수"]
+        self.assertIn("최적 배치 점수", scores)
+        self.assertIn("차선 배치 점수", scores)
+        self.assertIn("점수 차이", scores)
+        # The runner-up still marks the roles that moved.
+        self.assertIn("↔", dict(zip(names, (f.value for f in embed.fields)))["차선 배치"])
+
+    async def test_details_appends_the_full_matrix_unchanged(self):
+        _, plain_channel = await self._run_one()
+        plain = plain_channel.send.await_args.kwargs["embeds"]
+
+        _, channel = await self._run_one(details=True)
+        embeds = channel.send.await_args.kwargs["embeds"]
+
+        self.assertEqual(len(embeds), 2)
+        assignment, matrix = embeds
+        # The concise half is byte-for-byte what the default response shows.
+        self.assertEqual(assignment.to_dict(), plain[0].to_dict())
         self.assertEqual(len(matrix.fields), len(command.PLAYER_SLOTS))
+        for index, field in enumerate(matrix.fields):
+            with self.subTest(player=index):
+                self.assertIn(f"Player{index}#TEST", field.name)
+                # Every cell keeps its E/F/R/C/games values, one line per role.
+                lines = [line for line in field.value.splitlines() if line.startswith(("✅", "  "))]
+                self.assertEqual(len(lines), len(ROLE_ORDER))
+                for line in lines:
+                    for factor in ("E ", "F ", "R ", "C ", "B ", "N ", "경기"):
+                        self.assertIn(factor, line)
+                self.assertEqual(sum(line.startswith("✅") for line in lines), 1)
         for embed in embeds:
             with self.subTest(title=embed.title):
                 self.assertLessEqual(len(embed), 6000)
+
+    async def test_details_changes_nothing_about_collection_or_scoring(self):
+        _, plain_channel = await self._run_one()
+        plain = plain_channel.send.await_args.kwargs["embeds"][0]
+        collected = self.collect.await_count
+
+        _, channel = await self._run_one(details=True)
+
+        # Cached, so no new collection, and the recommendation is identical.
+        self.assertEqual(self.collect.await_count, collected)
+        self.assertEqual(
+            channel.send.await_args.kwargs["embeds"][0].to_dict(), plain.to_dict()
+        )
 
     async def test_depth_controls_only_how_much_history_is_collected(self):
         slash = self._assignroles_command()

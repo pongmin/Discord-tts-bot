@@ -137,14 +137,17 @@ def render_matrix_embed(result: RoleAssignmentResult) -> discord.Embed:
         title="🧪 선수별 포지션 적합도",
         description=("각 선수의 개인 적합도입니다. 본인의 최적 포지션이 100%이고, "
                      "나머지는 그에 대한 비율입니다.\n"
-                     "실력은 솔로 랭크 티어 점수이며, 배치는 실력 × 적합도의 합이 "
-                     "가장 큰 쪽을 고릅니다.\n"
+                     "실력은 랭크·최근 폼·KDA를 합친 10점 만점 종합 점수이며, "
+                     "배치 계산에는 쓰이지 않습니다.\n"
                      "✅ 는 추천 배치에서 실제로 맡는 자리입니다."),
         color=DIAGNOSTIC_COLOR,
     )
     assigned = {fit.player_id: fit.role for fit in result.best.fits}
     for player_id in result.player_ids:
-        lines = [f"실력: {result.strengths[player_id]:.2f}"]
+        # display_skill is a 0-100 composite; one digit either side of the
+        # point reads as a rating, which is what was asked for, and 100 is
+        # the only value that needs three characters.
+        lines = [f"실력: {result.strengths[player_id].display_skill / 10:.1f}"]
         for role in ROLE_ORDER:
             fit = result.matrix[(player_id, role)]
             mark = "✅" if assigned[player_id] == role else "  "

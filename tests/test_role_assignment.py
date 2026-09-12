@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from riot.riot_api import CLASH_QUEUE_ID, RANKED_SOLO_QUEUE_TYPE
 from scouting import ban_algorithm
+from scouting import role_assignment
 from scouting.ban_algorithm import (
     DEFAULT_NEUTRAL_RANK_SCORE, build_player_model, solo_rank_score,
 )
@@ -16,8 +17,10 @@ from scouting.role_assignment import (
     BREADTH_REFERENCE_POOL, DEFAULT_ROLE_PROBABILITY, MIN_ROLE_FIT,
     NEUTRAL_WINRATE, ROLE_BREADTH_EXPONENT, ROLE_ORDER, ROLE_SHARE_EXPONENT,
     ROLE_WR_PRIOR_GAMES, ROLE_WR_SENSITIVITY, assign_roles, breadth_score,
+    RECENT_FORM_GAMES, RECENT_FORM_PRIOR_GAMES, RECENT_FORM_SENSITIVITY,
+    SKILL_FORM_WEIGHT, SKILL_KDA_WEIGHT, SKILL_RANK_WEIGHT,
     build_role_candidate_model, effective_pool_size, global_baseline_winrate,
-    player_role_fits, player_strengths,
+    player_role_fits, player_strengths, recent_form_winrate, role_reference_kda,
 )
 from scouting.scouting_repo import ScoutingRepo
 
@@ -360,14 +363,14 @@ class AssignmentTests(RoleFixture):
                 self.assertAlmostEqual(
                     assignment.score,
                     math.fsum(
-                        result.strengths[fit.player_id] * fit.fit
+                        result.weight(fit.player_id) * fit.fit
                         for fit in assignment.fits
                     ),
                 )
         every = sorted(
             (
                 math.fsum(
-                    result.strengths[player_id] * result.matrix[(player_id, role)].fit
+                    result.weight(player_id) * result.matrix[(player_id, role)].fit
                     for player_id, role in zip(order, ROLE_ORDER)
                 )
                 for order in permutations(players)
@@ -394,21 +397,22 @@ class AssignmentTests(RoleFixture):
 
         strengths = player_strengths(self.repo(), players)
 
-        self.assertAlmostEqual(strengths[1], solo_rank_score("CHALLENGER", 500))
-        self.assertAlmostEqual(strengths[2], solo_rank_score("IRON", 0))
+        self.assertAlmostEqual(strengths[1].rank_score, solo_rank_score("CHALLENGER", 500))
+        self.assertAlmostEqual(strengths[2].rank_score, solo_rank_score("IRON", 0))
         # Unranked is unknown, not weak: the mean of this group's ranked
         # players, exactly the fallback recommend_bans applies.
-        expected = (strengths[1] + strengths[2]) / 2
+        expected = (strengths[1].rank_score + strengths[2].rank_score) / 2
         for player_id in (3, 4, 5):
             with self.subTest(player=player_id):
-                self.assertAlmostEqual(strengths[player_id], expected)
+                self.assertAlmostEqual(strengths[player_id].rank_score, expected)
 
     def test_no_ranked_player_anywhere_falls_back_to_the_fixed_midpoint(self):
         players = self.build_team()
         strengths = player_strengths(self.repo(), players)
 
         self.assertEqual(
-            set(strengths.values()), {DEFAULT_NEUTRAL_RANK_SCORE}
+            {strength.rank_score for strength in strengths.values()},
+            {DEFAULT_NEUTRAL_RANK_SCORE},
         )
 
     def test_strength_moves_the_assignment_without_touching_role_fit(self):
@@ -443,6 +447,144 @@ class AssignmentTests(RoleFixture):
         self.assertEqual(after[1], "TOP")
         # E itself never moved - only what the search does with it.
         self.assertEqual({key: fit.fit for key, fit in result.matrix.items()}, fits_before)
+
+    def test_weight_is_rank_times_recent_form_and_nothing_else(self):
+        players = self.build_team()
+        self.rank(1, "DIAMOND", 40)
+        repo = self.repo()
+
+        strength = player_strengths(repo, players)[1]
+
+        self.assertAlmostEqual(strength.rank_score, solo_rank_score("DIAMOND", 40))
+        self.assertAlmostEqual(strength.recent_winrate, recent_form_winrate(repo, 1))
+        self.assertAlmostEqual(
+            strength.form,
+            math.exp(RECENT_FORM_SENSITIVITY * (strength.recent_winrate - NEUTRAL_WINRATE)),
+        )
+        self.assertAlmostEqual(strength.weight, strength.rank_score * strength.form)
+        # The display score is on its own scale and is NOT the weight.
+        self.assertNotAlmostEqual(strength.weight, strength.display_skill)
+
+    def test_recent_form_is_a_weak_multiplier_on_the_last_games_only(self):
+        self.player(1)
+        # Ancient losses, then a recent winning streak: only the tail counts.
+        self.add_games(1, "TOP", 60, 0, days_ago=30)
+        self.add_games(1, "TOP", RECENT_FORM_GAMES, RECENT_FORM_GAMES, days_ago=1)
+        hot = recent_form_winrate(self.repo(), 1)
+
+        self.assertGreater(hot, 0.5)
+        # K-shrunk toward 0.5, so even a clean sweep never reaches 1.0.
+        self.assertLess(hot, 1.0)
+        self.assertAlmostEqual(
+            hot,
+            (RECENT_FORM_GAMES + RECENT_FORM_PRIOR_GAMES * NEUTRAL_WINRATE)
+            / (RECENT_FORM_GAMES + RECENT_FORM_PRIOR_GAMES),
+        )
+        # Weak: a maximal streak moves W by well under 20%.
+        self.assertLess(math.exp(RECENT_FORM_SENSITIVITY * (hot - NEUTRAL_WINRATE)), 1.2)
+
+    def test_no_solo_queue_games_leaves_form_exactly_neutral(self):
+        self.player(1)
+        self.add_games(1, "TOP", 20, 20, queue=400)
+
+        self.assertAlmostEqual(recent_form_winrate(self.repo(), 1), NEUTRAL_WINRATE)
+
+    def test_display_skill_is_the_weighted_composite_on_0_to_100(self):
+        players = self.build_team()
+        self.rank(1, "CHALLENGER", 500)
+        self.rank(2, "IRON")
+
+        strengths = player_strengths(self.repo(), players)
+
+        for strength in strengths.values():
+            with self.subTest(player=strength.player_id):
+                self.assertGreaterEqual(strength.display_skill, 0.0)
+                self.assertLessEqual(strength.display_skill, 100.0)
+        # Rank carries 65% of it, so two players alike in everything but rank
+        # are separated by roughly that much.
+        self.assertGreater(
+            strengths[1].display_skill - strengths[2].display_skill,
+            100 * SKILL_RANK_WEIGHT * 0.9,
+        )
+        self.assertAlmostEqual(
+            SKILL_RANK_WEIGHT + SKILL_FORM_WEIGHT + SKILL_KDA_WEIGHT, 1.0
+        )
+
+    def test_kda_is_measured_against_the_same_roles_own_reference(self):
+        """Role-aware: a support is compared with supports, not with junglers."""
+        players = self.build_team()
+        # Other players seen in UTILITY in player 5's own matches, with the
+        # assist-heavy numbers that role actually produces.
+        self.conn.execute(
+            "INSERT INTO players (id, puuid, game_name, tag_line) VALUES (?,?,?,?)",
+            (99, "puuid-99", "Other99", "TEST"),
+        )
+        for row in self.conn.execute(
+            "SELECT match_id FROM player_matches WHERE player_id=5"
+        ).fetchall():
+            self.conn.execute(
+                "INSERT INTO player_matches (player_id,match_id,champion_id,champion_name,"
+                "canonical_role,win,kills,deaths,assists) VALUES (?,?,?,?,?,?,?,?,?)",
+                (99, row["match_id"], 200, "Champion200", "UTILITY", 1, 1, 5, 20),
+            )
+        self.conn.commit()
+        repo = self.repo()
+
+        reference = role_reference_kda(repo, 5, "UTILITY")
+
+        self.assertAlmostEqual(reference, 21 / 5)
+        # An unseen role has no reference at all, which reads as neutral, not zero.
+        self.assertEqual(role_reference_kda(repo, 5, "JUNGLE"), 0.0)
+
+    def test_display_skill_inputs_do_not_move_the_assignment(self):
+        """KDA and the skill weights are display-only: the search cannot see them."""
+        players = self.build_team()
+        self.rank(1, "PLATINUM", 20)
+        repo = self.repo()
+        before = assign_roles(repo, players)
+        skill_before = {
+            pid: strength.display_skill for pid, strength in before.strengths.items()
+        }
+
+        # Reweighting the composite changes every display score and must change
+        # nothing about W, the score, or the chosen assignment.
+        with patch.multiple(
+            role_assignment,
+            SKILL_RANK_WEIGHT=0.2, SKILL_FORM_WEIGHT=0.2, SKILL_KDA_WEIGHT=0.6,
+        ):
+            after = assign_roles(repo, players)
+
+        self.assertNotEqual(
+            skill_before,
+            {pid: strength.display_skill for pid, strength in after.strengths.items()},
+        )
+        for player_id in players:
+            with self.subTest(player=player_id):
+                self.assertAlmostEqual(
+                    before.weight(player_id), after.weight(player_id)
+                )
+        self.assertEqual(
+            [(fit.role, fit.player_id) for fit in before.best.fits],
+            [(fit.role, fit.player_id) for fit in after.best.fits],
+        )
+        self.assertAlmostEqual(before.best.score, after.best.score)
+
+    def test_the_w_inputs_do_move_the_assignment(self):
+        """The other half of the claim: rank and form are not display-only."""
+        players = self.build_team()
+        before = assign_roles(self.repo(), players)
+        # One player far above the rest: W is the only thing that changed.
+        self.rank(3, "CHALLENGER", 900)
+        self.rank(1, "IRON")
+        after = assign_roles(self.repo(), players)
+
+        self.assertNotAlmostEqual(before.weight(3), after.weight(3))
+        self.assertNotAlmostEqual(before.best.score, after.best.score)
+        # E is untouched by any of it.
+        self.assertEqual(
+            {key: fit.fit for key, fit in before.matrix.items()},
+            {key: fit.fit for key, fit in after.matrix.items()},
+        )
 
     def test_runner_up_is_a_different_assignment(self):
         players = self.build_team()
@@ -484,8 +626,12 @@ class AssignmentTests(RoleFixture):
         result = assign_roles(self.repo(), [1, 2, 3, 4, 5])
 
         assigned = {fit.player_id: fit.role for fit in result.best.fits}
-        self.assertEqual(assigned[5], "UTILITY")
-        self.assertFalse(result.fit(5, "UTILITY").observed)
+        # Players 1 and 5 both main TOP, so one of them eats UTILITY; which one
+        # is a W question, not a crash-safety one.
+        filler = next(fit.player_id for fit in result.best.fits if fit.role == "UTILITY")
+        self.assertIn(filler, (1, 5))
+        self.assertFalse(result.fit(filler, "UTILITY").observed)
+        self.assertEqual(sorted(assigned[p] for p in (1, 5)), ["TOP", "UTILITY"])
         self.assertTrue(math.isfinite(result.best.score))
 
 

@@ -125,6 +125,10 @@ class ScoutingRepo:
         The player's own role does not restrict the match set. This v1 local
         meta sample pools all patches, while respecting queue_ids and the
         repository's game_end cutoff. Each participant/match appears once.
+
+        kills/deaths/assists are selected alongside the pick so callers can
+        also read a same-role KDA reference off this sample; the ban model
+        uses only champion_id and role from it.
         """
         cutoff_clause, cutoff_params = self._cutoff_clause("m")
         queue_clause, queue_params = self._queue_in_clause(queue_ids)
@@ -132,7 +136,7 @@ class ScoutingRepo:
         query = f"""
             SELECT
                 pm.player_id, pm.match_id, pm.champion_id, pm.champion_name,
-                pm.canonical_role, pm.win,
+                pm.canonical_role, pm.win, pm.kills, pm.deaths, pm.assists,
                 m.game_start, m.game_end, m.game_version, m.patch, m.queue_id
             FROM player_matches pm
             JOIN matches m ON m.match_id = pm.match_id

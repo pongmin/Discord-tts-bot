@@ -124,8 +124,8 @@ class AssignRolesCommandTests(AssignRolesFixture):
         for index, field in enumerate(matrix.fields):
             with self.subTest(player=index):
                 self.assertIn(f"Player{index}#TEST", field.name)
-                # Strength first, then the five roles.
-                self.assertRegex(field.value, r"실력: \d+\.\d\d\n")
+                # The skill score first, then the five roles.
+                self.assertRegex(field.value, r"실력: \d+\.\d\n")
                 lines = [line for line in field.value.splitlines() if line.startswith(("✅", "  "))]
                 # All five roles, each as a percentage and nothing else - no
                 # raw E, no factors, no game counts anywhere in the embed.

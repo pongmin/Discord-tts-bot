@@ -33,9 +33,18 @@ up instead, as the player weight W in the assignment score:
     S(p,r) = W_p * E(p,r)
     Score(A) = sum over the five seats of S(p, assigned_role)
 
-W is the ban recommender's own `solo_rank_score`, reused verbatim - including its
-"unranked means unknown, not weak" fallback - so the two commands rank player
-strength on exactly one scale.
+    W = RankStrength * RecentForm
+
+RankStrength is the ban recommender's own `solo_rank_score`, reused verbatim -
+including its "unranked means unknown, not weak" fallback - so the two commands
+rank player strength on exactly one scale. RecentForm is a weak multiplier
+around 1.0 off recent solo-queue win rate. Nothing else is in W: no KDA, no
+champion pool, no champion threat, and no role fit, which is E's job.
+
+`display_skill` on PlayerStrength is a different number for a different purpose:
+a 0-100 composite (rank 65%, recent form 20%, role-normalized KDA 15%) shown in
+the `details:true` view and read by nothing else. It is not W and must never be
+substituted for it - it deliberately includes KDA, which W excludes.
 
 The sum is over S and not over log(W * E) precisely because W is per-player: a
 log-sum would split into sum(log W) + sum(log E), and sum(log W) is the same
@@ -91,6 +100,37 @@ MIN_ROLE_FIT = 1e-6
 # A player with no usable queue 420/400 games at all has no baseline to shrink
 # toward; R then collapses to exp(0) = 1 for every role, which is the intent.
 NEUTRAL_WINRATE = 0.5
+
+# --- W, the assignment weight -------------------------------------------------
+# Solo queue only: W is meant to say how strong this player is at the game they
+# are ranked in, and draft games have no rank attached to them.
+SOLO_QUEUE_ID = 420
+# How many recent solo-queue games count as "recent form". Placeholder v1 value.
+RECENT_FORM_GAMES = 20
+# RecentForm = exp(this * (recent_wr_adj - 0.5)). Deliberately a third of
+# ROLE_WR_SENSITIVITY, which is itself a secondary correction inside E: form is
+# the weakest input in the whole model, a nudge on top of rank and nothing more.
+# At this sensitivity a 20-game heater lands near 1.06 and a slump near 0.94.
+RECENT_FORM_SENSITIVITY = 0.5
+# Same shrinkage the ban model applies to win rates, toward the fixed neutral
+# prior rather than the player's own baseline: a hot streak should read as form
+# only against 50%, not against however well this player usually does.
+RECENT_FORM_PRIOR_GAMES = K
+
+# --- display_skill, which the assignment never reads ---------------------------
+# Weights of the 0-100 display score (sum to 1). Rank dominates by the same
+# reasoning as PLAYER_THREAT_RANK_EXPONENT in the ban model: it is the one
+# input that is actually calibrated against the whole server.
+SKILL_RANK_WEIGHT = 0.65
+SKILL_FORM_WEIGHT = 0.20
+SKILL_KDA_WEIGHT = 0.15
+# solo_rank_score spans [1, len(TIERS)] plus a sub-0.01 LP term, so this maps
+# IRON to 0 and CHALLENGER to 1 without inventing a second rank scale.
+MIN_RANK_SCORE = 1.0
+MAX_RANK_SCORE = float(len(TIERS))
+# KDA at the same level as the role's local reference scores this, so a player
+# exactly average for their role sits mid-scale rather than at either end.
+NEUTRAL_KDA_COMPONENT = 0.5
 
 
 def _player_label(player: sqlite3.Row | None, player_id: int) -> str:
@@ -289,36 +329,169 @@ def player_role_fits(repo: ScoutingRepo, player_id: int) -> dict[str, RoleFit]:
     return fits
 
 
+def recent_form_winrate(repo: ScoutingRepo, player_id: int) -> float:
+    """Win rate over this player's last RECENT_FORM_GAMES solo-queue games.
+
+    Shrunk toward the neutral 0.5 prior with the ban model's own K, exactly as
+    PLAYER_THREAT_WR_PRIOR does for its form factor: with few recent games the
+    number stays near 0.5 rather than swinging to 1.0 on a three-game sample.
+    Solo queue only - draft games carry no rank and are not what form means
+    here. No recent games at all gives exactly the neutral rate.
+    """
+    rows = repo.get_all_matches(player_id, queue_ids=(SOLO_QUEUE_ID,))
+    # get_all_matches is ordered oldest-first, so the recent window is the tail.
+    results = [row["win"] for row in rows if row["win"] in (0, 1)][-RECENT_FORM_GAMES:]
+    return (
+        (sum(results) + RECENT_FORM_PRIOR_GAMES * NEUTRAL_WINRATE)
+        / (len(results) + RECENT_FORM_PRIOR_GAMES)
+    )
+
+
+@dataclass(frozen=True)
+class PlayerStrength:
+    """W and its parts for one player, plus the display-only skill score.
+
+    `weight` is the ONLY field the assignment search reads. `display_skill` is
+    rendered and never multiplied into anything - it deliberately mixes in KDA,
+    which W excludes, so feeding it back into scoring would put champion
+    performance into a value that is supposed to answer "how strong is this
+    player" and nothing else.
+    """
+
+    player_id: int
+    rank_score: float        # RankStrength
+    is_ranked: bool
+    recent_winrate: float    # the shrunk recent solo-queue win rate
+    form: float              # RecentForm
+    kda: float               # this player's KDA in their most-played role
+    role_reference_kda: float  # the same role's local-meta KDA, 0 if unknown
+    display_skill: float     # 0-100, UI only
+
+    @property
+    def weight(self) -> float:
+        """W = RankStrength * RecentForm. Nothing else belongs in here."""
+        return self.rank_score * self.form
+
+
+def role_reference_kda(repo: ScoutingRepo, player_id: int, role: str) -> float:
+    """Average KDA of OTHER players seen in `role`, from this player's matches.
+
+    The same local-meta sample `build_player_model` uses for pick rates, read
+    for takedowns per death instead. This is what makes the KDA half of
+    display_skill role-aware: a support is measured against other supports, so
+    the assist-heavy roles are not simply scored higher than the rest. Returns
+    0.0 when the sample has no usable deaths to divide by, which callers read
+    as "no reference" rather than as a KDA of zero.
+    """
+    rows = repo.get_other_participant_role_matches(
+        player_id, role, queue_ids=tuple(QUEUE_WEIGHTS)
+    )
+    takedowns = sum((row["kills"] or 0) + (row["assists"] or 0) for row in rows)
+    deaths = sum(row["deaths"] or 0 for row in rows)
+    if not rows or deaths <= 0:
+        return 0.0
+    return takedowns / deaths
+
+
+def _kda_component(kda: float, reference: float) -> float:
+    """KDA against its role reference, squashed into [0, 1).
+
+    ratio / (ratio + 1), so parity with the role's own average scores exactly
+    NEUTRAL_KDA_COMPONENT and the tail saturates instead of letting one
+    farming game dominate a score the other 85% is carefully bounded on. With
+    no reference to compare against, neutral.
+    """
+    if reference <= 0 or kda <= 0:
+        return NEUTRAL_KDA_COMPONENT
+    ratio = kda / reference
+    return ratio / (ratio + 1)
+
+
 def player_strengths(
     repo: ScoutingRepo, player_ids: Sequence[int]
-) -> dict[int, float]:
-    """W: `solo_rank_score` for each player, on the ban model's own scale.
+) -> dict[int, PlayerStrength]:
+    """W and the display score for each player, from the same rank snapshot.
 
-    No second strength formula: this is `solo_rank_score(tier, lp)` off the same
-    latest-at-cutoff solo-queue snapshot `build_player_model` reads, and the same
-    fallback `recommend_bans` applies - an unranked player is unknown, not weak,
-    so they borrow the mean W of the ranked players in this very group, and only
-    a group with no ranked player at all falls back to the fixed midpoint.
+    W = RankStrength * RecentForm:
 
-    Unlike the ban recommender, nothing here normalizes W into shares: Score is
-    a sum of W * E across five seats, and dividing every W by their total would
-    only rescale all 120 assignments by the same factor.
+      RankStrength is `solo_rank_score(tier, lp)`, the ban recommender's own
+      function on the same latest-at-cutoff snapshot `build_player_model`
+      reads, with the same fallback `recommend_bans` applies - an unranked
+      player is unknown, not weak, so they borrow the mean RankStrength of the
+      ranked players in this very group, and only a group with no ranked player
+      at all falls back to the fixed midpoint.
+
+      RecentForm is a deliberately weak multiplier around 1.0 (see
+      RECENT_FORM_SENSITIVITY). Nothing else enters W: not KDA, not champion
+      pool, not champion threat, and certainly not role fit, which is E's job
+      and would be double-counted by S = W * E.
+
+    display_skill is computed here because it shares these inputs, but it is a
+    separate number on a separate scale and no caller may feed it back into the
+    search. Unlike W it is normalized to 0-100, and it does include KDA.
     """
-    scores = {}
+    ranks = {}
     for player_id in player_ids:
         rank = repo.get_latest_rank_snapshot(player_id, RANKED_SOLO_QUEUE_TYPE)
         tier = (rank["tier"] or "").upper() if rank else ""
-        scores[player_id] = (
-            solo_rank_score(tier, rank["lp"]) if tier in TIERS else None
-        )
-    ranked = [score for score in scores.values() if score is not None]
+        ranks[player_id] = solo_rank_score(tier, rank["lp"]) if tier in TIERS else None
+    ranked = [score for score in ranks.values() if score is not None]
     neutral = (
         math.fsum(ranked) / len(ranked) if ranked else DEFAULT_NEUTRAL_RANK_SCORE
     )
-    return {
-        player_id: neutral if score is None else score
-        for player_id, score in scores.items()
-    }
+
+    strengths = {}
+    for player_id in player_ids:
+        rank_score = neutral if ranks[player_id] is None else ranks[player_id]
+        winrate = recent_form_winrate(repo, player_id)
+        form = math.exp(RECENT_FORM_SENSITIVITY * (winrate - NEUTRAL_WINRATE))
+
+        # Role-aware by construction: KDA is read in the role this player
+        # actually plays and compared against that role's own reference, never
+        # against a jungler's numbers if they are a support.
+        main_role = _most_played_role(repo, player_id)
+        kda = _player_role_kda(repo, player_id, main_role)
+        reference = role_reference_kda(repo, player_id, main_role)
+
+        rank_component = min(1.0, max(0.0,
+            (rank_score - MIN_RANK_SCORE) / (MAX_RANK_SCORE - MIN_RANK_SCORE)
+        ))
+        skill = 100.0 * (
+            SKILL_RANK_WEIGHT * rank_component
+            + SKILL_FORM_WEIGHT * winrate
+            + SKILL_KDA_WEIGHT * _kda_component(kda, reference)
+        )
+        strengths[player_id] = PlayerStrength(
+            player_id, rank_score, ranks[player_id] is not None, winrate, form,
+            kda, reference, skill,
+        )
+    return strengths
+
+
+def _most_played_role(repo: ScoutingRepo, player_id: int) -> str:
+    """The role this player has the most collected games in; ROLE_ORDER breaks ties."""
+    rows = repo.get_all_matches(player_id, queue_ids=tuple(QUEUE_WEIGHTS))
+    counts = {role: 0 for role in ROLE_ORDER}
+    for row in rows:
+        role = (row["canonical_role"] or "").upper()
+        if role in counts:
+            counts[role] += 1
+    return max(ROLE_ORDER, key=lambda role: (counts[role], -ROLE_ORDER.index(role)))
+
+
+def _player_role_kda(repo: ScoutingRepo, player_id: int, role: str) -> float:
+    """Takedowns per death in one role - the same quantity as PlayerModel.kda_baseline.
+
+    Read straight off the role's rows rather than through `build_player_model`
+    so it also exists for a role the player has never played (0.0), and so the
+    display score never depends on which champions happen to be in the pool.
+    """
+    rows = repo.get_role_matches(player_id, role, queue_ids=tuple(QUEUE_WEIGHTS))
+    takedowns = sum((row["kills"] or 0) + (row["assists"] or 0) for row in rows)
+    deaths = sum(row["deaths"] or 0 for row in rows)
+    if not rows:
+        return 0.0
+    return takedowns / max(1, deaths)
 
 
 @dataclass(frozen=True)
@@ -339,7 +512,7 @@ class RoleAssignmentResult:
     labels: dict[int, str]
     baselines: dict[int, float]
     matrix: dict[tuple[int, str], RoleFit]
-    strengths: dict[int, float]
+    strengths: dict[int, PlayerStrength]
     best: Assignment
     runner_up: Assignment
 
@@ -350,6 +523,10 @@ class RoleAssignmentResult:
 
     def fit(self, player_id: int, role: str) -> RoleFit:
         return self.matrix[(player_id, role)]
+
+    def weight(self, player_id: int) -> float:
+        """W for one player: the only part of PlayerStrength scoring may read."""
+        return self.strengths[player_id].weight
 
 
 def assign_roles(repo: ScoutingRepo, player_ids: Sequence[int]) -> RoleAssignmentResult:
@@ -385,7 +562,8 @@ def assign_roles(repo: ScoutingRepo, player_ids: Sequence[int]) -> RoleAssignmen
         # assignment scores above zero.
         chosen = tuple(matrix[(player_id, role)] for player_id, role in zip(order, ROLE_ORDER))
         ranked.append(Assignment(
-            chosen, math.fsum(strengths[fit.player_id] * fit.fit for fit in chosen)
+            chosen,
+            math.fsum(strengths[fit.player_id].weight * fit.fit for fit in chosen),
         ))
     # Stable sort: equal scores keep itertools.permutations order.
     ranked.sort(key=lambda assignment: -assignment.score)
@@ -436,7 +614,7 @@ def format_assignment(result: RoleAssignmentResult) -> str:
         "",
     ]
     for fit in result.best.fits:
-        weight = result.strengths[fit.player_id]
+        weight = result.weight(fit.player_id)
         lines.append(
             f"{fit.role:<8} {fit.label} W={weight:.4f} E={fit.fit:.4f} "
             f"S={weight * fit.fit:.4f} games={fit.games}"
@@ -444,8 +622,11 @@ def format_assignment(result: RoleAssignmentResult) -> str:
     lines.append("")
     lines.append("matrix (E / F / R / C / B / games):")
     for player_id in result.player_ids:
+        strength = result.strengths[player_id]
         lines.append(
-            f"{result.labels[player_id]} W={result.strengths[player_id]:.4f} "
+            f"{result.labels[player_id]} W={strength.weight:.4f} "
+            f"(rank={strength.rank_score:.4f} form={strength.form:.4f}) "
+            f"display_skill={strength.display_skill:.1f} "
             f"baseline={result.baselines[player_id]:.3f}"
         )
         for role in ROLE_ORDER:
@@ -459,9 +640,10 @@ def format_assignment(result: RoleAssignmentResult) -> str:
 
 
 __all__ = [
-    "ROLE_ORDER", "Assignment", "RoleAssignmentResult", "RoleCandidateModel", "RoleFit",
-    "assign_roles", "breadth_score", "build_role_candidate_model",
-    "effective_pool_size", "format_assignment", "global_baseline_winrate",
-    "personal_fit_percent", "player_role_fits", "player_strengths",
+    "ROLE_ORDER", "Assignment", "PlayerStrength", "RoleAssignmentResult",
+    "RoleCandidateModel", "RoleFit", "assign_roles", "breadth_score",
+    "build_role_candidate_model", "effective_pool_size", "format_assignment",
+    "global_baseline_winrate", "personal_fit_percent", "player_role_fits",
+    "player_strengths", "recent_form_winrate", "role_reference_kda",
     "team_fit_percent",
 ]

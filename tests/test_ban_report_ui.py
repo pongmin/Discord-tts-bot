@@ -434,13 +434,14 @@ class ScoutingReportViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.view.page_index, 4)
         self.assertEqual(button(self.view, "OP.GG 보기").url, presentation(4).opgg_url)
 
-    async def test_other_users_cannot_turn_pages(self):
+    async def test_any_user_can_turn_pages(self):
+        # The report is a team-wide read, so a non-owner's click turns the page
+        # for everyone instead of getting an ephemeral refusal.
         interaction = self.interaction(user_id=999)
-        self.assertFalse(await self.view.interaction_check(interaction))
-        self.assertEqual(self.view.page_index, 0)
-        interaction.response.send_message.assert_awaited_once()
-        self.assertTrue(interaction.response.send_message.await_args.kwargs["ephemeral"])
-        self.assertTrue(await self.view.interaction_check(self.interaction()))
+        await button(self.view, "다음").callback(interaction)
+        self.assertEqual(self.view.page_index, 1)
+        interaction.response.send_message.assert_not_awaited()
+        interaction.response.edit_message.assert_awaited_once()
 
     async def test_stale_boundary_clicks_cannot_leave_the_seven_pages(self):
         interaction = self.interaction()

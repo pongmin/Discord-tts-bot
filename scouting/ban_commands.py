@@ -571,12 +571,6 @@ class PersistentBanReportRouter(discord.ui.View):
             )
             return
 
-        if interaction.user.id != row["owner_id"]:
-            await interaction.response.send_message(
-                "페이지 이동은 이 리포트를 요청한 사용자만 할 수 있습니다.", ephemeral=True
-            )
-            return
-
         await interaction.response.defer()
         opponents = db.ban_report_opponents(row)
         target_page = max(0, min(LAST_PAGE_INDEX, row["page_index"] + offset))

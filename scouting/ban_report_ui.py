@@ -539,6 +539,10 @@ class ScoutingReportView(discord.ui.View):
     (원래 이 view 객체는 사라진 상태에서도) 같은 custom_id로 등록해 둔
     ban_commands.PersistentBanReportRouter로 인터랙션을 넘겨줄 수 있음.
 
+    페이지 이동은 누구나 할 수 있음 - 리포트는 팀 전체가 같이 보는 것이라
+    owner_id는 "누가 요청했는지" 기록용으로만 남겨두고 인터랙션을 막지 않음.
+    따라서 페이지는 보는 사람 전원이 공유함(한 명이 넘기면 모두에게 넘어감).
+
     on_page_change(self, new_page_index)가 주어지면 페이지가 바뀔 때마다
     await됨 - DB에 현재 페이지를 기록해서 재시작 후 복구할 때 마지막으로 보던
     페이지부터 이어서 열리게 하는 용도(ban_commands.py가 주입함). 이 클래스
@@ -586,12 +590,6 @@ class ScoutingReportView(discord.ui.View):
             if presentation.opgg_url:
                 self._profile_button = discord.ui.Button(label="OP.GG 보기", url=presentation.opgg_url, row=0)
                 self.add_item(self._profile_button)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.owner_id:
-            return True
-        await interaction.response.send_message("페이지 이동은 이 리포트를 요청한 사용자만 할 수 있습니다.", ephemeral=True)
-        return False
 
     async def _move(self, interaction: discord.Interaction, offset: int) -> None:
         async with self._page_lock:

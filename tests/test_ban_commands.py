@@ -546,7 +546,7 @@ class BanCommandTests(ScoutingCommandFixture):
         row = db.get_ban_report(self.anchor, message_id)
         self.assertEqual(row["page_index"], 1)
 
-    async def test_persistent_router_rejects_non_owner(self):
+    async def test_persistent_router_lets_a_non_owner_turn_pages(self):
         owner_id, message_id = await self._send_one_report()
         router = command.PersistentBanReportRouter()
         self.addCleanup(router.stop)
@@ -554,11 +554,15 @@ class BanCommandTests(ScoutingCommandFixture):
 
         await self._find_button(router, "다음").callback(interaction)
 
-        interaction.response.send_message.assert_awaited_once()
-        self.assertTrue(interaction.response.send_message.call_args.kwargs["ephemeral"])
-        interaction.response.defer.assert_not_awaited()
+        interaction.response.send_message.assert_not_awaited()
+        interaction.response.defer.assert_awaited_once()
+        revived = interaction.edit_original_response.call_args.kwargs["view"]
+        self.addCleanup(revived.stop)
+        # The stored owner still records who requested the report, and the page
+        # move is persisted for everyone.
+        self.assertEqual(revived.owner_id, owner_id)
         row = db.get_ban_report(self.anchor, message_id)
-        self.assertEqual(row["page_index"], 0)
+        self.assertEqual(row["page_index"], 1)
 
     async def test_persistent_router_handles_a_report_it_never_saved(self):
         router = command.PersistentBanReportRouter()

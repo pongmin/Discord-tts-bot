@@ -61,11 +61,37 @@ class BanCommandError(ValueError):
     """An actionable input or incomplete-collection error."""
 
 
-def parse_inputs(inputs: dict[str, str]) -> list[tuple[str, str, str]]:
+def depth_choices() -> list[app_commands.Choice]:
+    """The one depth option list, shared by every scouting command.
+
+    Built fresh per call so each command tree owns its own Choice objects,
+    while the caps themselves stay defined only in DEPTH_CAPS.
+    """
+    return [
+        app_commands.Choice(name="빠르게 · 30경기", value="quick"),
+        app_commands.Choice(name="기본 · 100경기", value="normal"),
+        app_commands.Choice(name="깊게 · 200경기", value="deep"),
+    ]
+
+
+DEPTH_DESCRIPTION = "수집 깊이: 빠르게 30 / 기본 100 / 깊게 200 경기, 선수·큐별"
+
+
+def parse_inputs(
+    inputs: dict[str, str], *,
+    slots: tuple[str, ...] = ROLE_INPUTS, labels: dict[str, str] | None = None,
+) -> list[tuple[str, str, str]]:
+    """Validate five Riot IDs, one per slot, with no I/O.
+
+    /banrecommend's slots are the five roles (the default); /assignroles passes
+    its own player1..player5 slots, which carry no role meaning. The parsing,
+    duplicate rule and error wording are otherwise identical for both.
+    """
+    labels = ROLE_LABELS if labels is None else labels
     parsed = []
     seen = {}
-    for role in ROLE_INPUTS:
-        raw = inputs[role]
+    for slot in slots:
+        raw = inputs[slot]
         try:
             game_name, tag_line = parse_riot_id(raw)
             # The shared parser splits once; reject extra separators here without
@@ -73,12 +99,12 @@ def parse_inputs(inputs: dict[str, str]) -> list[tuple[str, str, str]]:
             if raw.count("#") != 1:
                 raise InvalidRiotIdError("이름#태그 형식으로 입력해주세요.")
         except InvalidRiotIdError as exc:
-            raise BanCommandError(f"{ROLE_LABELS[role]} 입력 오류 ({raw}): {exc}") from exc
+            raise BanCommandError(f"{labels[slot]} 입력 오류 ({raw}): {exc}") from exc
         key = (game_name.casefold(), tag_line.casefold())
         if key in seen:
-            raise BanCommandError(f"동일 계정 중복 입력: {ROLE_LABELS[seen[key]]}, {ROLE_LABELS[role]} ({raw})")
-        seen[key] = role
-        parsed.append((role, game_name, tag_line))
+            raise BanCommandError(f"동일 계정 중복 입력: {labels[seen[key]]}, {labels[slot]} ({raw})")
+        seen[key] = slot
+        parsed.append((slot, game_name, tag_line))
     return parsed
 
 
@@ -162,50 +188,63 @@ def _collection_summary(result: dict) -> tuple[int, int, int, int, str]:
     return requested, secured, failed, skipped, " · ".join(parts)
 
 
-async def prepare_opponents(
-    inputs: dict[str, str], progress, depth: str = "normal",
-) -> tuple[list[tuple[int, str]], list[str]]:
-    """Resolve, collect and rank all five opponents.
+async def prepare_players(
+    inputs: dict[str, str], progress, depth: str = "normal", *,
+    slots: tuple[str, ...] = ROLE_INPUTS, labels: dict[str, str] | None = None,
+    role_required: bool = True,
+) -> tuple[list[tuple[str, int]], list[str]]:
+    """Resolve, collect and rank all five players; the shared collection stage.
 
-    Returns the opponents and any collection warnings, which are surfaced with
-    the report rather than aborting it: collection is tolerant of a few matches
-    Riot will not hand over, and only stops when too little of a player's
-    history could be secured (or when the failure is fatal for every request).
+    One collection per player, never one per role: both queues' history is
+    fetched once at the chosen depth, and every later read (bans, role fit)
+    works off that same stored dataset and the same cache.
+
+    Returns (slot, player_id) pairs in `slots` order plus any collection
+    warnings, which are surfaced with the report rather than aborting it:
+    collection is tolerant of a few matches Riot will not hand over, and only
+    stops when too little of a player's history could be secured (or when the
+    failure is fatal for every request).
+
+    `role_required=True` (what /banrecommend needs) additionally refuses a
+    player with no games in their own slot's role, since there would be nothing
+    to model. /assignroles passes False - an unplayed role is exactly one of the
+    cells it has to score - and only requires some 420/400 history at all.
 
     `progress(message, role=..., done=...)` reports both the stage text (used
     verbatim in failure messages) and, where a stage belongs to one player,
-    which role it is and whether that player is now fully collected.
+    which slot it is and whether that player is now fully collected.
     """
     if depth not in DEPTH_CAPS:
         raise BanCommandError("수집 깊이는 빠르게, 기본, 깊게 중에서 선택해주세요.")
+    labels = ROLE_LABELS if labels is None else labels
     cap = DEPTH_CAPS[depth]
-    parsed = parse_inputs(inputs)
+    parsed = parse_inputs(inputs, slots=slots, labels=labels)
     resolved = []
     seen_puuids = {}
     # Resolve all five before writing/collecting; aliases can map to one PUUID.
-    for role, game_name, tag_line in parsed:
+    for slot, game_name, tag_line in parsed:
         label = f"{game_name}#{tag_line}"
-        await progress(f"{ROLE_LABELS[role]} 계정 조회 ({label})", role=role)
+        await progress(f"{labels[slot]} 계정 조회 ({label})", role=slot)
         account = await get_account_by_riot_id(game_name, tag_line)
         if account.puuid in seen_puuids:
             raise BanCommandError(
-                f"동일 계정 중복: {ROLE_LABELS[seen_puuids[account.puuid]]}, {ROLE_LABELS[role]} ({label})"
+                f"동일 계정 중복: {labels[seen_puuids[account.puuid]]}, {labels[slot]} ({label})"
             )
-        seen_puuids[account.puuid] = role
-        resolved.append((role, label, account))
+        seen_puuids[account.puuid] = slot
+        resolved.append((slot, label, account))
 
-    opponents = []
+    collected = []
     warnings: list[str] = []
     with closing(db.get_connection()) as conn:
         db.init_db(conn)
         collection_cutoff = db.now_ms()
-        for role, label, account in resolved:
+        for slot, label, account in resolved:
             player_id = db.get_or_create_player(
                 conn, account.puuid, account.game_name, account.tag_line
             )
             for queue_id in QUEUE_IDS:
                 await progress(
-                    f"{ROLE_LABELS[role]} {QUEUE_LABELS[queue_id]} 경기 확보 ({label})", role=role
+                    f"{labels[slot]} {QUEUE_LABELS[queue_id]} 경기 확보 ({label})", role=slot
                 )
                 # Count actual player/queue rows at cutoff, regardless of role
                 # or fetch-state age. Never limit the algorithm's read-side pool.
@@ -220,7 +259,7 @@ async def prepare_opponents(
                     queue_id=queue_id, max_count=cap, conn=conn,
                 )
                 requested, secured, failed, skipped, summary = _collection_summary(result)
-                where = f"{ROLE_LABELS[role]} {QUEUE_LABELS[queue_id]} ({label})"
+                where = f"{labels[slot]} {QUEUE_LABELS[queue_id]} ({label})"
                 if result["aborted"]:
                     db.refresh_fetch_state(conn, player_id, queue_id, False)
                     raise BanCommandError(
@@ -237,20 +276,35 @@ async def prepare_opponents(
                 if failed or skipped:
                     warnings.append(f"{COLLECTION_WARNING_PREFIX}{where}: {summary}")
                 if result["player_id"] != player_id:
-                    raise BanCommandError(f"{ROLE_LABELS[role]} 수집 계정 불일치 ({label}). 추천을 중단합니다.")
-            await progress(f"{ROLE_LABELS[role]} 솔로 랭크 확보 ({label})", role=role)
+                    raise BanCommandError(f"{labels[slot]} 수집 계정 불일치 ({label}). 분석을 중단합니다.")
+            await progress(f"{labels[slot]} 솔로 랭크 확보 ({label})", role=slot)
             await _ensure_solo_rank(conn, player_id, account)
             with ScoutingRepo(cutoff_time=db.now_ms(), conn=conn) as repo:
-                if not repo.get_role_matches(player_id, role.upper(), queue_ids=QUEUE_IDS):
+                if role_required and not repo.get_role_matches(
+                    player_id, slot.upper(), queue_ids=QUEUE_IDS
+                ):
                     raise BanCommandError(
-                        f"{ROLE_LABELS[role]} 데이터 부족 ({label}): 수집된 솔로 랭크·일반 드래프트에 "
-                        f"{ROLE_LABELS[role]} 기록이 없어 추천을 중단합니다."
+                        f"{labels[slot]} 데이터 부족 ({label}): 수집된 솔로 랭크·일반 드래프트에 "
+                        f"{labels[slot]} 기록이 없어 추천을 중단합니다."
+                    )
+                if not role_required and not repo.get_all_matches(player_id, queue_ids=QUEUE_IDS):
+                    raise BanCommandError(
+                        f"{labels[slot]} 데이터 부족 ({label}): 수집된 솔로 랭크·일반 드래프트 "
+                        "기록이 없어 포지션을 배치할 수 없습니다."
                     )
             # Only now is this player fully collected: account, both queues'
-            # matches, rank, and a non-empty role history.
-            await progress(f"{ROLE_LABELS[role]} 수집 완료 ({label})", role=role, done=True)
-            opponents.append((player_id, role.upper()))
-    return opponents, warnings
+            # matches, rank, and enough history for the caller's model.
+            await progress(f"{labels[slot]} 수집 완료 ({label})", role=slot, done=True)
+            collected.append((slot, player_id))
+    return collected, warnings
+
+
+async def prepare_opponents(
+    inputs: dict[str, str], progress, depth: str = "normal",
+) -> tuple[list[tuple[int, str]], list[str]]:
+    """The five role slots of /banrecommend, as (player_id, ROLE) pairs."""
+    collected, warnings = await prepare_players(inputs, progress, depth)
+    return [(player_id, slot.upper()) for slot, player_id in collected], warnings
 
 
 def _recommendation(
@@ -365,25 +419,33 @@ class BanProgressStatus:
     is skipped silently.
     """
 
-    def __init__(self, channel, inputs: dict[str, str]):
+    def __init__(
+        self, channel, inputs: dict[str, str], *,
+        slots: tuple[str, ...] = ROLE_INPUTS, labels: dict[str, str] | None = None,
+        title: str = "🔎 밴 추천 분석 중", calculation: str = "밴 계산",
+    ):
         self.channel = channel
         self.inputs = inputs
+        self.slots = slots
+        self.labels = ROLE_LABELS if labels is None else labels
+        self.title = title
+        self.calculation = calculation
         self.done: set[str] = set()
         self.current: str | None = None
-        self.footer = f"0 / {len(ROLE_INPUTS)} 완료"
+        self.footer = f"0 / {len(slots)} 완료"
         self.message = None
         self.rendered = None
 
     def render(self) -> str:
-        lines = ["🔎 밴 추천 분석 중", ""]
-        for role in ROLE_INPUTS:
-            if role in self.done:
+        lines = [self.title, ""]
+        for slot in self.slots:
+            if slot in self.done:
                 mark = "✅"
-            elif role == self.current:
+            elif slot == self.current:
                 mark = "⏳"
             else:
                 mark = "⬜"
-            lines.append(f"{mark} {ROLE_LABELS[role]} — {self.inputs[role]}")
+            lines.append(f"{mark} {self.labels[slot]} — {self.inputs[slot]}")
         lines.extend(["", self.footer])
         return "\n".join(lines)[:1900]
 
@@ -411,29 +473,29 @@ class BanProgressStatus:
         except Exception:
             logger.warning("Ban progress status message could not be edited", exc_info=True)
 
-    async def set_current(self, role: str) -> None:
-        """Mark `role` as the player being worked on right now."""
-        if role in self.done:
+    async def set_current(self, slot: str) -> None:
+        """Mark `slot` as the player being worked on right now."""
+        if slot in self.done:
             return
-        self.current = role
+        self.current = slot
         await self._refresh()
 
-    async def mark_done(self, role: str) -> None:
-        """Mark `role` finished - account, matches and rank all collected."""
-        self.done.add(role)
-        if self.current == role:
+    async def mark_done(self, slot: str) -> None:
+        """Mark `slot` finished - account, matches and rank all collected."""
+        self.done.add(slot)
+        if self.current == slot:
             self.current = None
-        self.footer = f"{len(self.done)} / {len(ROLE_INPUTS)} 완료"
+        self.footer = f"{len(self.done)} / {len(self.slots)} 완료"
         await self._refresh()
 
     async def start_calculation(self) -> None:
         self.current = None
-        self.footer = f"✅ {len(self.done)} / {len(ROLE_INPUTS)} 수집 완료 · 밴 계산 중..."
+        self.footer = f"✅ {len(self.done)} / {len(self.slots)} 수집 완료 · {self.calculation} 중..."
         await self._refresh()
 
     async def complete(self) -> None:
         self.current = None
-        self.footer = f"✅ {len(self.done)} / {len(ROLE_INPUTS)} 수집 완료 · 분석 완료"
+        self.footer = f"✅ {len(self.done)} / {len(self.slots)} 수집 완료 · 분석 완료"
         await self._refresh()
 
     async def fail(self, stage: str) -> None:
@@ -621,20 +683,14 @@ def setup_ban_commands(bot):
     # 로그인 전에 호출해도 되는 동기 등록이라 setup 시점에 바로 둠.
     bot.add_view(PersistentBanReportRouter())
 
-    depth_choices = [
-        app_commands.Choice(name="빠르게 · 30경기", value="quick"),
-        app_commands.Choice(name="기본 · 100경기", value="normal"),
-        app_commands.Choice(name="깊게 · 200경기", value="deep"),
-    ]
-
     @bot.tree.command(name="banrecommend", description="상대 5명의 역할별 Riot ID로 밴 3개를 추천합니다.")
     @app_commands.describe(
         top="TOP 선수 (이름#태그)", jungle="JUNGLE 선수 (이름#태그)",
         middle="MID 선수 (이름#태그)", bottom="BOTTOM 선수 (이름#태그)",
         utility="SUPPORT 선수 (이름#태그)",
-        depth="수집 깊이: 빠르게 30 / 기본 100 / 깊게 200 경기, 선수·큐별",
+        depth=DEPTH_DESCRIPTION,
     )
-    @app_commands.choices(depth=depth_choices)
+    @app_commands.choices(depth=depth_choices())
     async def banrecommend(
         interaction: discord.Interaction, top: str, jungle: str,
         middle: str, bottom: str, utility: str,
@@ -685,9 +741,9 @@ def setup_ban_commands(bot):
     )
     @app_commands.describe(
         riot_id="상대 팀원 한 명 (이름#태그)",
-        depth="수집 깊이: 빠르게 30 / 기본 100 / 깊게 200 경기, 선수·큐별",
+        depth=DEPTH_DESCRIPTION,
     )
-    @app_commands.choices(depth=depth_choices)
+    @app_commands.choices(depth=depth_choices())
     async def clashban(interaction: discord.Interaction, riot_id: str, depth: str = "normal"):
         """/banrecommend와 같은 파이프라인을, 역할별 Riot ID 5개 대신 격전 팀
         조회로 채워 실행함. 밴 로직·수집·리포트는 전부 기존 것을 그대로 씀.

@@ -1,0 +1,295 @@
+"""Role-fit and assignment regressions against the real cutoff-filtered repo."""
+
+import math
+from itertools import permutations
+import sqlite3
+import unittest
+from unittest.mock import patch
+
+from riot.riot_api import CLASH_QUEUE_ID, RANKED_SOLO_QUEUE_TYPE
+from scouting import ban_algorithm
+from scouting.ban_algorithm import build_player_model
+from scouting import scouting_db as db
+from scouting.role_assignment import (
+    DEFAULT_ROLE_PROBABILITY, MIN_ROLE_FIT, NEUTRAL_WINRATE, ROLE_ORDER,
+    ROLE_WR_PRIOR_GAMES, ROLE_WR_SENSITIVITY, assign_roles,
+    build_role_candidate_model, global_baseline_winrate, player_role_fits,
+)
+from scouting.scouting_repo import ScoutingRepo
+
+
+DAY_MS = 86_400_000
+NOW = 2_000_000_000_000
+
+
+class RoleFixture(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        db.init_db(self.conn)
+        self.addCleanup(self.conn.close)
+        self.sequence = 0
+
+    def player(self, player_id: int, name: str = "Role") -> int:
+        self.conn.execute(
+            "INSERT INTO players (id, puuid, game_name, tag_line) VALUES (?,?,?,?)",
+            (player_id, f"puuid-{player_id}", f"{name}{player_id}", "TEST"),
+        )
+        return player_id
+
+    def add_games(self, player_id, role, games, wins, *, queue=420, champion_id=None,
+                  days_ago=1):
+        """`wins` of `games` in `role`, spread over two champions by default."""
+        for index in range(games):
+            self.sequence += 1
+            match_id = f"RA_{self.sequence}"
+            start = NOW - days_ago * DAY_MS
+            self.conn.execute(
+                "INSERT INTO matches (match_id,game_start,game_end,queue_id,raw_file_path,fetched_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (match_id, start, start + 1000, queue, "", NOW),
+            )
+            champion = champion_id if champion_id is not None else 100 + index % 2
+            self.conn.execute(
+                "INSERT INTO player_matches (player_id,match_id,champion_id,champion_name,"
+                "canonical_role,win,kills,deaths,assists) VALUES (?,?,?,?,?,?,?,?,?)",
+                (player_id, match_id, champion, f"Champion{champion}", role,
+                 1 if index < wins else 0, 5, 4, 6),
+            )
+        self.conn.commit()
+
+    def repo(self) -> ScoutingRepo:
+        repo = ScoutingRepo(cutoff_time=NOW, conn=self.conn)
+        self.addCleanup(repo.close)
+        return repo
+
+
+class RoleCandidateModelTests(RoleFixture):
+    def test_a_played_role_is_the_strict_model_verbatim(self):
+        self.player(1)
+        self.add_games(1, "MIDDLE", 20, 12)
+        repo = self.repo()
+
+        strict = build_player_model(repo, 1, "MIDDLE")
+        candidate = build_role_candidate_model(repo, 1, "MIDDLE")
+
+        # Same Others/P_final/Threat/KDA numbers, not a re-derivation of them.
+        self.assertTrue(candidate.observed)
+        self.assertEqual(candidate.model, strict)
+        self.assertEqual(candidate.strength(frozenset()), strict.strength(frozenset()))
+        self.assertEqual(candidate.games_in_role, 20)
+        self.assertEqual(candidate.wins_in_role, 12)
+
+    def test_an_unplayed_role_is_neutral_instead_of_raising(self):
+        self.player(1)
+        self.add_games(1, "MIDDLE", 20, 12)
+        repo = self.repo()
+
+        # The strict model still refuses it; only the tolerant one does not.
+        with self.assertRaises(ValueError):
+            build_player_model(repo, 1, "UTILITY")
+
+        candidate = build_role_candidate_model(repo, 1, "UTILITY")
+        self.assertFalse(candidate.observed)
+        self.assertEqual((candidate.games_in_role, candidate.wins_in_role), (0, 0))
+        self.assertEqual(candidate.model.champions, {})
+        # Others-only: the neutral unseen-champion prior, never zero strength.
+        self.assertEqual(candidate.strength(frozenset()), 1.0)
+        self.assertEqual(candidate.model.baseline_winrate, global_baseline_winrate(repo, 1))
+
+    def test_unknown_player_and_role_still_raise(self):
+        self.player(1)
+        self.add_games(1, "TOP", 3, 2)
+        repo = self.repo()
+        with self.assertRaises(ValueError):
+            build_role_candidate_model(repo, 999, "TOP")
+        with self.assertRaises(ValueError):
+            build_role_candidate_model(repo, 1, "FILL")
+        with ScoutingRepo(conn=self.conn) as uncapped:
+            with self.assertRaises(ValueError):
+                build_role_candidate_model(uncapped, 1, "TOP")
+
+
+class GlobalBaselineTests(RoleFixture):
+    def test_all_roles_and_both_queues_count_once(self):
+        self.player(1)
+        self.add_games(1, "TOP", 10, 8)
+        self.add_games(1, "UTILITY", 10, 2, queue=400)
+        # Clash is validation ground truth, never part of the model's pool.
+        self.add_games(1, "MIDDLE", 10, 10, queue=CLASH_QUEUE_ID)
+        repo = self.repo()
+
+        self.assertAlmostEqual(global_baseline_winrate(repo, 1), 0.5)
+
+    def test_no_collected_games_falls_back_to_neutral(self):
+        self.player(1)
+        self.assertEqual(global_baseline_winrate(self.repo(), 1), NEUTRAL_WINRATE)
+
+
+class RoleFitTests(RoleFixture):
+    def test_factors_match_the_specified_formulas(self):
+        self.player(1)
+        self.add_games(1, "TOP", 40, 28)
+        self.add_games(1, "JUNGLE", 10, 3)
+        repo = self.repo()
+        baseline = global_baseline_winrate(repo, 1)
+        fits = player_role_fits(repo, 1)
+
+        self.assertAlmostEqual(fits["TOP"].role_probability, 40 / 50)
+        self.assertAlmostEqual(fits["JUNGLE"].role_probability, 10 / 50)
+        # F is normalized by the player's own main role, so it peaks at 1.
+        self.assertAlmostEqual(fits["TOP"].share, 1.0)
+        self.assertAlmostEqual(fits["JUNGLE"].share, 0.25)
+
+        for role, games, wins in (("TOP", 40, 28), ("JUNGLE", 10, 3)):
+            with self.subTest(role=role):
+                fit = fits[role]
+                expected_wr = (
+                    (wins + ROLE_WR_PRIOR_GAMES * baseline) / (games + ROLE_WR_PRIOR_GAMES)
+                )
+                self.assertAlmostEqual(fit.winrate_adjusted, expected_wr)
+                self.assertAlmostEqual(
+                    fit.winrate_ratio,
+                    math.exp(ROLE_WR_SENSITIVITY * (expected_wr - baseline)),
+                )
+                self.assertAlmostEqual(
+                    fit.strength, build_player_model(repo, 1, role).strength(frozenset())
+                )
+                self.assertAlmostEqual(fit.fit, fit.share * fit.winrate_ratio * fit.strength)
+
+        # Above-baseline role lifts R, below-baseline role cuts it.
+        self.assertGreater(fits["TOP"].winrate_ratio, 1.0)
+        self.assertLess(fits["JUNGLE"].winrate_ratio, 1.0)
+
+    def test_unplayed_roles_are_floored_not_zero(self):
+        self.player(1)
+        self.add_games(1, "TOP", 10, 5)
+        fits = player_role_fits(self.repo(), 1)
+
+        for role in ("JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"):
+            with self.subTest(role=role):
+                self.assertEqual(fits[role].share, 0.0)
+                self.assertEqual(fits[role].fit, MIN_ROLE_FIT)
+                self.assertFalse(fits[role].observed)
+                # Still finite under log, which is what the assignment needs.
+                self.assertTrue(math.isfinite(math.log(fits[role].fit)))
+
+    def test_a_player_with_no_games_is_equally_unsupported_everywhere(self):
+        self.player(1)
+        fits = player_role_fits(self.repo(), 1)
+
+        for role in ROLE_ORDER:
+            with self.subTest(role=role):
+                self.assertEqual(fits[role].role_probability, DEFAULT_ROLE_PROBABILITY)
+                self.assertAlmostEqual(fits[role].share, 1.0)
+                self.assertAlmostEqual(fits[role].fit, 1.0)
+
+    def test_rank_does_not_move_role_fit(self):
+        """solo_rank_score is constant across roles, so it must not be in E."""
+        self.player(1)
+        self.add_games(1, "TOP", 20, 12)
+        self.add_games(1, "MIDDLE", 8, 4)
+        before = {role: fit.fit for role, fit in player_role_fits(self.repo(), 1).items()}
+
+        db.insert_rank_snapshot(
+            self.conn, 1, RANKED_SOLO_QUEUE_TYPE, "CHALLENGER", "I", 1200, 300, 100, NOW - 1000
+        )
+        self.conn.commit()
+        after = {role: fit.fit for role, fit in player_role_fits(self.repo(), 1).items()}
+
+        self.assertEqual(before, after)
+
+
+class AssignmentTests(RoleFixture):
+    def build_team(self, off_role_games=6):
+        """Five one-role mains, each with a little history in the next role."""
+        for index, role in enumerate(ROLE_ORDER, start=1):
+            self.player(index)
+            self.add_games(index, role, 40 + index, 22 + index)
+            self.add_games(index, ROLE_ORDER[index % len(ROLE_ORDER)], off_role_games, 2)
+        return list(range(1, 6))
+
+    def test_best_assignment_gives_everyone_their_main(self):
+        players = self.build_team()
+        result = assign_roles(self.repo(), players)
+
+        self.assertEqual(
+            [(fit.role, fit.player_id) for fit in result.best.fits],
+            list(zip(ROLE_ORDER, players)),
+        )
+        self.assertEqual(len(result.matrix), len(players) * len(ROLE_ORDER))
+        self.assertGreater(result.margin, 0)
+
+    def test_score_is_the_log_sum_and_the_best_of_all_120(self):
+        players = self.build_team()
+        result = assign_roles(self.repo(), players)
+
+        for assignment in (result.best, result.runner_up):
+            with self.subTest(score=assignment.score):
+                self.assertAlmostEqual(
+                    assignment.score,
+                    math.fsum(math.log(fit.fit) for fit in assignment.fits),
+                )
+        every = sorted(
+            (
+                math.fsum(
+                    math.log(result.matrix[(player_id, role)].fit)
+                    for player_id, role in zip(order, ROLE_ORDER)
+                )
+                for order in permutations(players)
+            ),
+            reverse=True,
+        )
+        self.assertEqual(len(every), 120)
+        self.assertAlmostEqual(result.best.score, every[0])
+        self.assertAlmostEqual(result.runner_up.score, every[1])
+        self.assertGreaterEqual(result.best.score, result.runner_up.score)
+        self.assertAlmostEqual(result.margin, result.best.score - result.runner_up.score)
+
+    def test_runner_up_is_a_different_assignment(self):
+        players = self.build_team()
+        result = assign_roles(self.repo(), players)
+
+        self.assertNotEqual(
+            [fit.player_id for fit in result.best.fits],
+            [fit.player_id for fit in result.runner_up.fits],
+        )
+        for assignment in (result.best, result.runner_up):
+            with self.subTest(assignment=assignment.score):
+                self.assertEqual(
+                    sorted(fit.player_id for fit in assignment.fits), sorted(players)
+                )
+                self.assertEqual([fit.role for fit in assignment.fits], list(ROLE_ORDER))
+
+    def test_no_ban_recommendation_is_computed(self):
+        players = self.build_team()
+        with patch.object(ban_algorithm, "recommend_bans") as recommend:
+            assign_roles(self.repo(), players)
+        recommend.assert_not_called()
+
+    def test_five_distinct_players_are_required(self):
+        players = self.build_team()
+        repo = self.repo()
+        with self.assertRaises(ValueError):
+            assign_roles(repo, players[:4])
+        with self.assertRaises(ValueError):
+            assign_roles(repo, [players[0]] + players[:4])
+
+    def test_a_player_who_never_played_a_role_can_still_be_assigned_to_it(self):
+        # Four mains plus one player who has only ever played TOP: somebody has
+        # to take the empty role, and the model must produce it, not crash.
+        for index, role in enumerate(ROLE_ORDER[:4], start=1):
+            self.player(index)
+            self.add_games(index, role, 30, 17)
+        self.player(5)
+        self.add_games(5, "TOP", 25, 13)
+        result = assign_roles(self.repo(), [1, 2, 3, 4, 5])
+
+        assigned = {fit.player_id: fit.role for fit in result.best.fits}
+        self.assertEqual(assigned[5], "UTILITY")
+        self.assertFalse(result.fit(5, "UTILITY").observed)
+        self.assertTrue(math.isfinite(result.best.score))
+
+
+if __name__ == "__main__":
+    unittest.main()

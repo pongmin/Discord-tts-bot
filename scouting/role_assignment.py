@@ -26,9 +26,22 @@ against real diagnostic matrices (which is why both B and raw N_eff are in the
 The ban recommender is untouched: nothing here calls `recommend_bans`, and no
 ban candidate, pruning, rho aggregation, KDA or Others computation is redefined.
 
-`solo_rank_score` is deliberately absent from E. It is constant across roles for
-the same player, so it cannot change any assignment's ranking - it would only add
-the same constant to all 120 permutations.
+`solo_rank_score` is deliberately absent from E: it is constant across roles for
+the same player, so it says nothing about WHERE they belong. It enters one level
+up instead, as the player weight W in the assignment score:
+
+    S(p,r) = W_p * E(p,r)
+    Score(A) = sum over the five seats of S(p, assigned_role)
+
+W is the ban recommender's own `solo_rank_score`, reused verbatim - including its
+"unranked means unknown, not weak" fallback - so the two commands rank player
+strength on exactly one scale.
+
+The sum is over S and not over log(W * E) precisely because W is per-player: a
+log-sum would split into sum(log W) + sum(log E), and sum(log W) is the same
+constant for all 120 permutations, so W would cancel and buy nothing. Summing S
+instead makes the search prefer putting the stronger player where the fit is
+worth more, which is the whole point of weighting by strength.
 
 Where the ban model is strict (a role with no games is a hard error, because
 recommending bans against a player you have never seen in that role is
@@ -46,8 +59,10 @@ from itertools import permutations
 import math
 import sqlite3
 
+from riot.riot_api import RANKED_SOLO_QUEUE_TYPE
 from scouting.ban_algorithm import (
-    K, QUEUE_WEIGHTS, ROLES, PlayerModel, build_player_model,
+    DEFAULT_NEUTRAL_RANK_SCORE, K, QUEUE_WEIGHTS, ROLES, TIERS, PlayerModel,
+    build_player_model, solo_rank_score,
 )
 from scouting.scouting_repo import ScoutingRepo
 
@@ -274,6 +289,38 @@ def player_role_fits(repo: ScoutingRepo, player_id: int) -> dict[str, RoleFit]:
     return fits
 
 
+def player_strengths(
+    repo: ScoutingRepo, player_ids: Sequence[int]
+) -> dict[int, float]:
+    """W: `solo_rank_score` for each player, on the ban model's own scale.
+
+    No second strength formula: this is `solo_rank_score(tier, lp)` off the same
+    latest-at-cutoff solo-queue snapshot `build_player_model` reads, and the same
+    fallback `recommend_bans` applies - an unranked player is unknown, not weak,
+    so they borrow the mean W of the ranked players in this very group, and only
+    a group with no ranked player at all falls back to the fixed midpoint.
+
+    Unlike the ban recommender, nothing here normalizes W into shares: Score is
+    a sum of W * E across five seats, and dividing every W by their total would
+    only rescale all 120 assignments by the same factor.
+    """
+    scores = {}
+    for player_id in player_ids:
+        rank = repo.get_latest_rank_snapshot(player_id, RANKED_SOLO_QUEUE_TYPE)
+        tier = (rank["tier"] or "").upper() if rank else ""
+        scores[player_id] = (
+            solo_rank_score(tier, rank["lp"]) if tier in TIERS else None
+        )
+    ranked = [score for score in scores.values() if score is not None]
+    neutral = (
+        math.fsum(ranked) / len(ranked) if ranked else DEFAULT_NEUTRAL_RANK_SCORE
+    )
+    return {
+        player_id: neutral if score is None else score
+        for player_id, score in scores.items()
+    }
+
+
 @dataclass(frozen=True)
 class Assignment:
     """One complete player->role assignment, in ROLE_ORDER order."""
@@ -292,12 +339,13 @@ class RoleAssignmentResult:
     labels: dict[int, str]
     baselines: dict[int, float]
     matrix: dict[tuple[int, str], RoleFit]
+    strengths: dict[int, float]
     best: Assignment
     runner_up: Assignment
 
     @property
     def margin(self) -> float:
-        """How much log-score the best assignment wins by. Never negative."""
+        """How much score the best assignment wins by. Never negative."""
         return self.best.score - self.runner_up.score
 
     def fit(self, player_id: int, role: str) -> RoleFit:
@@ -305,10 +353,12 @@ class RoleAssignmentResult:
 
 
 def assign_roles(repo: ScoutingRepo, player_ids: Sequence[int]) -> RoleAssignmentResult:
-    """Best and second-best of all 120 role permutations, by sum(log E).
+    """Best and second-best of all 120 role permutations, by sum(W * E).
 
-    Scoring is a plain log-sum - no softmax, no probabilities over assignments.
-    Ties keep permutation order, so the result is deterministic.
+    Scoring is a plain weighted sum - no softmax, no probabilities over
+    assignments, and deliberately not a log-sum, in which the per-player W
+    would cancel (see the module docstring). Ties keep permutation order, so
+    the result is deterministic.
     """
     player_ids = tuple(player_ids)
     if len(player_ids) != len(ROLE_ORDER):
@@ -326,16 +376,21 @@ def assign_roles(repo: ScoutingRepo, player_ids: Sequence[int]) -> RoleAssignmen
             matrix[(player_id, role)] = fit
             labels[player_id] = fit.label
 
+    strengths = player_strengths(repo, player_ids)
+
     ranked = []
     for order in permutations(player_ids):
-        # order[i] takes ROLE_ORDER[i]; E is floored at MIN_ROLE_FIT, so log is
-        # always finite.
+        # order[i] takes ROLE_ORDER[i]. Both factors are strictly positive - E
+        # is floored at MIN_ROLE_FIT and W at the bottom tier - so every
+        # assignment scores above zero.
         chosen = tuple(matrix[(player_id, role)] for player_id, role in zip(order, ROLE_ORDER))
-        ranked.append(Assignment(chosen, math.fsum(math.log(fit.fit) for fit in chosen)))
+        ranked.append(Assignment(
+            chosen, math.fsum(strengths[fit.player_id] * fit.fit for fit in chosen)
+        ))
     # Stable sort: equal scores keep itertools.permutations order.
     ranked.sort(key=lambda assignment: -assignment.score)
     return RoleAssignmentResult(
-        player_ids, labels, baselines, matrix, ranked[0], ranked[1],
+        player_ids, labels, baselines, matrix, strengths, ranked[0], ranked[1],
     )
 
 
@@ -357,28 +412,20 @@ def personal_fit_percent(result: RoleAssignmentResult, fit: RoleFit) -> float:
     return fit.fit / best * 100.0
 
 
-def geometric_mean_fit(assignment: Assignment) -> float:
-    """GM(A) = exp(Score(A) / 5): the log-sum read back as an average E.
-
-    Score is sum(log E) over the five seats, so its exponential per seat is the
-    geometric mean of the five role fits - the same ranking, on a scale that
-    can be compared as a ratio.
-    """
-    return math.exp(assignment.score / len(ROLE_ORDER))
-
-
 def team_fit_percent(result: RoleAssignmentResult, assignment: Assignment) -> float:
-    """Display-only: GM(A) against GM(best), as a percentage.
+    """Display-only: Score(A) against Score(best), as a percentage.
 
-    The best assignment is 100% by construction and the runner-up shows how
-    little is given up by preferring it - a 96.4% second choice is a real
-    alternative, a 40% one is not. Computed from the score difference directly
-    rather than as a ratio of two exponentials, which keeps it finite for the
-    very small E values MIN_ROLE_FIT allows.
+    Score is now a plain sum of W * E rather than a sum of logs, so the ratio
+    of the two totals is the comparison that reads correctly - the geometric
+    mean this used to exponentiate has no meaning for a non-log score. Every
+    term is positive, so the ratio is well defined and the best assignment is
+    100% by construction; the runner-up then shows how little is given up by
+    preferring it - a 96.4% second choice is a real alternative, a 40% one is
+    not.
     """
-    return math.exp(
-        (assignment.score - result.best.score) / len(ROLE_ORDER)
-    ) * 100.0
+    if result.best.score <= 0:
+        return 0.0
+    return assignment.score / result.best.score * 100.0
 
 
 def format_assignment(result: RoleAssignmentResult) -> str:
@@ -389,11 +436,18 @@ def format_assignment(result: RoleAssignmentResult) -> str:
         "",
     ]
     for fit in result.best.fits:
-        lines.append(f"{fit.role:<8} {fit.label} E={fit.fit:.4f} games={fit.games}")
+        weight = result.strengths[fit.player_id]
+        lines.append(
+            f"{fit.role:<8} {fit.label} W={weight:.4f} E={fit.fit:.4f} "
+            f"S={weight * fit.fit:.4f} games={fit.games}"
+        )
     lines.append("")
     lines.append("matrix (E / F / R / C / B / games):")
     for player_id in result.player_ids:
-        lines.append(f"{result.labels[player_id]} baseline={result.baselines[player_id]:.3f}")
+        lines.append(
+            f"{result.labels[player_id]} W={result.strengths[player_id]:.4f} "
+            f"baseline={result.baselines[player_id]:.3f}"
+        )
         for role in ROLE_ORDER:
             fit = result.matrix[(player_id, role)]
             lines.append(
@@ -407,7 +461,7 @@ def format_assignment(result: RoleAssignmentResult) -> str:
 __all__ = [
     "ROLE_ORDER", "Assignment", "RoleAssignmentResult", "RoleCandidateModel", "RoleFit",
     "assign_roles", "breadth_score", "build_role_candidate_model",
-    "effective_pool_size", "format_assignment", "geometric_mean_fit",
-    "global_baseline_winrate", "personal_fit_percent", "player_role_fits",
+    "effective_pool_size", "format_assignment", "global_baseline_winrate",
+    "personal_fit_percent", "player_role_fits", "player_strengths",
     "team_fit_percent",
 ]

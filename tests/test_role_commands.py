@@ -97,11 +97,12 @@ class AssignRolesCommandTests(AssignRolesFixture):
         self.assertIn("최적 배치 팀 적합도 **100.0%**", scores)
         self.assertIn("차선 배치 팀 적합도", scores)
         self.assertIn("적합도 차이", scores)
-        # Percentages only out here: raw E and the log scores stay in details.
+        # Percentages only out here: raw E and the player's strength weight
+        # both stay in the details embed.
         for field in embed.fields:
             with self.subTest(field=field.name):
                 self.assertNotIn("E ", field.value)
-                self.assertNotIn("sum(log E)", field.value)
+                self.assertNotIn("실력", field.value)
         # Every seat is shown as a share of that player's own best role, and
         # each synthetic player mains the role they are given.
         self.assertEqual(fields["추천 배치"].count("개인 적합도 100%"), len(ROLE_ORDER))
@@ -123,6 +124,8 @@ class AssignRolesCommandTests(AssignRolesFixture):
         for index, field in enumerate(matrix.fields):
             with self.subTest(player=index):
                 self.assertIn(f"Player{index}#TEST", field.name)
+                # Strength first, then the five roles.
+                self.assertRegex(field.value, r"실력: \d+\.\d\d\n")
                 lines = [line for line in field.value.splitlines() if line.startswith(("✅", "  "))]
                 # All five roles, each as a percentage and nothing else - no
                 # raw E, no factors, no game counts anywhere in the embed.

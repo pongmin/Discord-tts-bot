@@ -23,9 +23,11 @@ ROLE_LABELS = {"TOP": "TOP", "JUNGLE": "JUNGLE", "MIDDLE": "MID",
 ROLE_WIDTH = max(len(label) for label in ROLE_LABELS.values())
 EMBED_COLOR = 0x3BA55D
 DIAGNOSTIC_COLOR = 0x4F545C
-# Below this the best and second-best assignments are close enough that the
-# choice between them is not really supported by the data.
-CLOSE_CALL_MARGIN = 0.10
+# Within this many points of team fit, the best and second-best assignments are
+# close enough that the choice between them is not really supported by the data.
+# A percentage rather than a raw score gap: Score is a sum of W * E, whose scale
+# moves with the group's rank, so no fixed gap in score units means one thing.
+CLOSE_CALL_PERCENT = 1.0
 FIELD_LIMIT = 1024
 
 
@@ -75,12 +77,10 @@ def _score_text(result: RoleAssignmentResult) -> str:
         f"차선 배치 팀 적합도 {_team_percent(runner_up)}",
         f"적합도 차이 **{_team_percent(100.0 - runner_up)}p**",
     ]
-    if result.margin < CLOSE_CALL_MARGIN:
+    if 100.0 - runner_up < CLOSE_CALL_PERCENT:
         lines.append("두 배치의 적합도가 거의 같습니다. 취향대로 골라도 무방합니다.")
     else:
-        lines.append(
-            "팀 적합도는 다섯 자리 적합도의 기하평균을 최적 배치 대비 비율로 나타낸 값입니다."
-        )
+        lines.append("팀 적합도는 배치 전체 점수를 최적 배치 대비 비율로 나타낸 값입니다.")
     return "\n".join(lines)[:FIELD_LIMIT]
 
 
@@ -125,21 +125,26 @@ def render_assignment_embed(result: RoleAssignmentResult) -> discord.Embed:
 def render_matrix_embed(result: RoleAssignmentResult) -> discord.Embed:
     """The full 5x5 view: every player against every role, as personal fit %.
 
-    Deliberately percentages only. The factors behind E - F, R, C, B, N_eff and
-    the raw game counts - stay in `format_assignment`, the plain-text developer
-    dump, because they answer a model-debugging question rather than the
-    "could this player have gone somewhere else" question this embed is for.
+    Deliberately percentages, plus the one number personal fit cannot carry:
+    W, the player's own strength, which is what lets the assignment prefer
+    putting the stronger player where the fit is worth more. The factors behind
+    E - F, R, C, B, N_eff and the raw game counts - stay in
+    `format_assignment`, the plain-text developer dump, because they answer a
+    model-debugging question rather than the "could this player have gone
+    somewhere else" question this embed is for.
     """
     embed = discord.Embed(
         title="🧪 선수별 포지션 적합도",
         description=("각 선수의 개인 적합도입니다. 본인의 최적 포지션이 100%이고, "
                      "나머지는 그에 대한 비율입니다.\n"
+                     "실력은 솔로 랭크 티어 점수이며, 배치는 실력 × 적합도의 합이 "
+                     "가장 큰 쪽을 고릅니다.\n"
                      "✅ 는 추천 배치에서 실제로 맡는 자리입니다."),
         color=DIAGNOSTIC_COLOR,
     )
     assigned = {fit.player_id: fit.role for fit in result.best.fits}
     for player_id in result.player_ids:
-        lines = []
+        lines = [f"실력: {result.strengths[player_id]:.2f}"]
         for role in ROLE_ORDER:
             fit = result.matrix[(player_id, role)]
             mark = "✅" if assigned[player_id] == role else "  "

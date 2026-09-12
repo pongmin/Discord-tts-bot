@@ -8,14 +8,16 @@ from unittest.mock import patch
 
 from riot.riot_api import CLASH_QUEUE_ID, RANKED_SOLO_QUEUE_TYPE
 from scouting import ban_algorithm
-from scouting.ban_algorithm import build_player_model
+from scouting.ban_algorithm import (
+    DEFAULT_NEUTRAL_RANK_SCORE, build_player_model, solo_rank_score,
+)
 from scouting import scouting_db as db
 from scouting.role_assignment import (
     BREADTH_REFERENCE_POOL, DEFAULT_ROLE_PROBABILITY, MIN_ROLE_FIT,
     NEUTRAL_WINRATE, ROLE_BREADTH_EXPONENT, ROLE_ORDER, ROLE_SHARE_EXPONENT,
     ROLE_WR_PRIOR_GAMES, ROLE_WR_SENSITIVITY, assign_roles, breadth_score,
     build_role_candidate_model, effective_pool_size, global_baseline_winrate,
-    player_role_fits,
+    player_role_fits, player_strengths,
 )
 from scouting.scouting_repo import ScoutingRepo
 
@@ -349,7 +351,7 @@ class AssignmentTests(RoleFixture):
         self.assertEqual(len(result.matrix), len(players) * len(ROLE_ORDER))
         self.assertGreater(result.margin, 0)
 
-    def test_score_is_the_log_sum_and_the_best_of_all_120(self):
+    def test_score_is_the_weighted_sum_and_the_best_of_all_120(self):
         players = self.build_team()
         result = assign_roles(self.repo(), players)
 
@@ -357,12 +359,15 @@ class AssignmentTests(RoleFixture):
             with self.subTest(score=assignment.score):
                 self.assertAlmostEqual(
                     assignment.score,
-                    math.fsum(math.log(fit.fit) for fit in assignment.fits),
+                    math.fsum(
+                        result.strengths[fit.player_id] * fit.fit
+                        for fit in assignment.fits
+                    ),
                 )
         every = sorted(
             (
                 math.fsum(
-                    math.log(result.matrix[(player_id, role)].fit)
+                    result.strengths[player_id] * result.matrix[(player_id, role)].fit
                     for player_id, role in zip(order, ROLE_ORDER)
                 )
                 for order in permutations(players)
@@ -374,6 +379,70 @@ class AssignmentTests(RoleFixture):
         self.assertAlmostEqual(result.runner_up.score, every[1])
         self.assertGreaterEqual(result.best.score, result.runner_up.score)
         self.assertAlmostEqual(result.margin, result.best.score - result.runner_up.score)
+
+    def rank(self, player_id: int, tier: str, lp: int = 0):
+        db.insert_rank_snapshot(
+            self.conn, player_id, RANKED_SOLO_QUEUE_TYPE, tier, "I", lp,
+            300, 100, NOW - 1000,
+        )
+        self.conn.commit()
+
+    def test_strength_is_the_ban_models_own_rank_score(self):
+        players = self.build_team()
+        self.rank(1, "CHALLENGER", 500)
+        self.rank(2, "IRON")
+
+        strengths = player_strengths(self.repo(), players)
+
+        self.assertAlmostEqual(strengths[1], solo_rank_score("CHALLENGER", 500))
+        self.assertAlmostEqual(strengths[2], solo_rank_score("IRON", 0))
+        # Unranked is unknown, not weak: the mean of this group's ranked
+        # players, exactly the fallback recommend_bans applies.
+        expected = (strengths[1] + strengths[2]) / 2
+        for player_id in (3, 4, 5):
+            with self.subTest(player=player_id):
+                self.assertAlmostEqual(strengths[player_id], expected)
+
+    def test_no_ranked_player_anywhere_falls_back_to_the_fixed_midpoint(self):
+        players = self.build_team()
+        strengths = player_strengths(self.repo(), players)
+
+        self.assertEqual(
+            set(strengths.values()), {DEFAULT_NEUTRAL_RANK_SCORE}
+        )
+
+    def test_strength_moves_the_assignment_without_touching_role_fit(self):
+        """The whole point of W: a contested role goes to the stronger player."""
+        # Two players want MIDDLE, one a little better suited to it; the other
+        # three are unambiguous mains, so only the MIDDLE/TOP pair is in play.
+        for index, role in enumerate(("JUNGLE", "BOTTOM", "UTILITY"), start=3):
+            self.player(index)
+            self.add_games(index, role, 60, 33)
+        self.player(1)
+        self.add_games(1, "MIDDLE", 40, 22)
+        self.add_games(1, "TOP", 30, 16)
+        self.player(2)
+        self.add_games(2, "MIDDLE", 34, 19)
+        self.add_games(2, "TOP", 32, 17)
+        players = [1, 2, 3, 4, 5]
+
+        before = {fit.player_id: fit.role for fit in assign_roles(self.repo(), players).best.fits}
+        fits_before = {
+            key: fit.fit for key, fit in assign_roles(self.repo(), players).matrix.items()
+        }
+        self.assertEqual(before[1], "MIDDLE")
+
+        # Player 2 is now far stronger in absolute terms; their slightly worse
+        # MIDDLE fit is now worth more to the team than player 1's.
+        self.rank(2, "CHALLENGER", 800)
+        self.rank(1, "IRON")
+        result = assign_roles(self.repo(), players)
+        after = {fit.player_id: fit.role for fit in result.best.fits}
+
+        self.assertEqual(after[2], "MIDDLE")
+        self.assertEqual(after[1], "TOP")
+        # E itself never moved - only what the search does with it.
+        self.assertEqual({key: fit.fit for key, fit in result.matrix.items()}, fits_before)
 
     def test_runner_up_is_a_different_assignment(self):
         players = self.build_team()

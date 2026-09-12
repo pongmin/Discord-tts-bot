@@ -11,9 +11,11 @@ from scouting import ban_algorithm
 from scouting.ban_algorithm import build_player_model
 from scouting import scouting_db as db
 from scouting.role_assignment import (
-    DEFAULT_ROLE_PROBABILITY, MIN_ROLE_FIT, NEUTRAL_WINRATE, ROLE_ORDER,
-    ROLE_WR_PRIOR_GAMES, ROLE_WR_SENSITIVITY, assign_roles,
-    build_role_candidate_model, global_baseline_winrate, player_role_fits,
+    BREADTH_REFERENCE_POOL, DEFAULT_ROLE_PROBABILITY, MIN_ROLE_FIT,
+    NEUTRAL_WINRATE, ROLE_BREADTH_EXPONENT, ROLE_ORDER, ROLE_SHARE_EXPONENT,
+    ROLE_WR_PRIOR_GAMES, ROLE_WR_SENSITIVITY, assign_roles, breadth_score,
+    build_role_candidate_model, effective_pool_size, global_baseline_winrate,
+    player_role_fits,
 )
 from scouting.scouting_repo import ScoutingRepo
 
@@ -155,11 +157,136 @@ class RoleFitTests(RoleFixture):
                 self.assertAlmostEqual(
                     fit.strength, build_player_model(repo, 1, role).strength(frozenset())
                 )
-                self.assertAlmostEqual(fit.fit, fit.share * fit.winrate_ratio * fit.strength)
+                self.assertAlmostEqual(
+                    fit.fit,
+                    (fit.share ** ROLE_SHARE_EXPONENT) * fit.winrate_ratio * fit.strength
+                    * (fit.breadth ** ROLE_BREADTH_EXPONENT),
+                )
 
         # Above-baseline role lifts R, below-baseline role cuts it.
         self.assertGreater(fits["TOP"].winrate_ratio, 1.0)
         self.assertLess(fits["JUNGLE"].winrate_ratio, 1.0)
+
+        # F enters E linearly, as the strongest term.
+        self.assertEqual(ROLE_SHARE_EXPONENT, 1.0)
+        self.assertAlmostEqual(fits["JUNGLE"].share ** ROLE_SHARE_EXPONENT, fits["JUNGLE"].share)
+
+
+class BreadthTests(RoleFixture):
+    def test_effective_pool_is_the_exponential_of_entropy(self):
+        self.player(1)
+        # Four champions, evenly played, all on the same day so the date weights
+        # cannot skew the personal distribution.
+        for champion in (101, 102, 103, 104):
+            self.add_games(1, "TOP", 8, 4, champion_id=champion)
+        repo = self.repo()
+
+        model = build_role_candidate_model(repo, 1, "TOP").model
+        self.assertAlmostEqual(effective_pool_size(model), 4.0, places=6)
+        self.assertAlmostEqual(
+            effective_pool_size(model),
+            math.exp(-math.fsum(
+                champion.p_personal * math.log(champion.p_personal)
+                for champion in model.champions.values()
+            )),
+        )
+
+    def test_a_one_trick_has_an_effective_pool_of_one(self):
+        self.player(1)
+        self.add_games(1, "MIDDLE", 30, 15, champion_id=99)
+        model = build_role_candidate_model(self.repo(), 1, "MIDDLE").model
+
+        self.assertEqual(len(model.champions), 1)
+        self.assertAlmostEqual(effective_pool_size(model), 1.0)
+
+    def test_others_is_not_counted_as_breadth(self):
+        self.player(1)
+        self.add_games(1, "BOTTOM", 20, 10, champion_id=42)
+        model = build_role_candidate_model(self.repo(), 1, "BOTTOM").model
+
+        # The unseen-champion prior carries real mass, and breadth ignores it:
+        # a one-trick stays a one-trick.
+        self.assertGreater(model.p_others, 0)
+        self.assertAlmostEqual(effective_pool_size(model), 1.0)
+        # An unplayed role is all Others and therefore has no breadth at all.
+        unplayed = build_role_candidate_model(self.repo(), 1, "TOP").model
+        self.assertEqual(unplayed.p_others, 1.0)
+        self.assertEqual(effective_pool_size(unplayed), 0.0)
+
+    def test_breadth_is_an_absolute_saturating_score(self):
+        reference = math.log1p(BREADTH_REFERENCE_POOL)
+        for pool in (0.0, 1.0, 3.0, 5.0, 9.0):
+            with self.subTest(effective_pool=pool):
+                self.assertAlmostEqual(
+                    breadth_score(pool), min(1.0, math.log1p(pool) / reference)
+                )
+        # The shape the constants are meant to produce: a one-trick clearly
+        # below full credit, ~3 champions moderate, N_REF and above saturated.
+        self.assertLess(breadth_score(1.0), 0.5)
+        self.assertTrue(0.7 < breadth_score(3.0) < 0.85)
+        self.assertEqual(breadth_score(BREADTH_REFERENCE_POOL), 1.0)
+        self.assertEqual(breadth_score(50.0), 1.0)
+        self.assertEqual(breadth_score(0.0), 0.0)
+        # Monotone in between, and never above the cap.
+        scores = [breadth_score(pool) for pool in (0.5, 1, 2, 3, 4, 5, 6, 20)]
+        self.assertEqual(scores, sorted(scores))
+        self.assertLessEqual(max(scores), 1.0)
+
+    def test_a_role_is_scored_on_its_own_pool_not_the_players_best_role(self):
+        self.player(1)
+        for champion in (101, 102, 103, 104):
+            self.add_games(1, "TOP", 10, 5, champion_id=champion)
+        for champion in (201, 202):
+            self.add_games(1, "JUNGLE", 10, 5, champion_id=champion)
+        fits = player_role_fits(self.repo(), 1)
+
+        self.assertAlmostEqual(fits["TOP"].effective_pool, 4.0, places=6)
+        self.assertAlmostEqual(fits["JUNGLE"].effective_pool, 2.0, places=6)
+        # The broadest role no longer normalizes to exactly 1.0 - four effective
+        # champions is genuinely short of the N_REF = 5 reference.
+        self.assertAlmostEqual(fits["TOP"].breadth, breadth_score(4.0))
+        self.assertLess(fits["TOP"].breadth, 1.0)
+        self.assertAlmostEqual(fits["JUNGLE"].breadth, breadth_score(2.0))
+        self.assertEqual(fits["MIDDLE"].breadth, 0.0)
+
+    def test_a_broad_pool_outscores_an_identical_narrow_one(self):
+        """Same role, same games, same win rate - only the pool differs.
+
+        This is what the absolute scale buys: both players are TOP-only, so a
+        per-player normalization would have tied them at B = 1.0.
+        """
+        self.player(1, name="Broad")
+        self.player(2, name="Narrow")
+        for champion in (101, 102, 103, 104):
+            self.add_games(1, "TOP", 10, 5, champion_id=champion)
+        self.add_games(2, "TOP", 40, 20, champion_id=101)
+        repo = self.repo()
+
+        broad = player_role_fits(repo, 1)["TOP"]
+        narrow = player_role_fits(repo, 2)["TOP"]
+
+        self.assertEqual((broad.games, broad.wins), (narrow.games, narrow.wins))
+        self.assertAlmostEqual(broad.share, narrow.share)
+        self.assertAlmostEqual(broad.winrate_ratio, narrow.winrate_ratio)
+        self.assertAlmostEqual(narrow.effective_pool, 1.0)
+        self.assertAlmostEqual(broad.effective_pool, 4.0, places=6)
+        self.assertGreater(broad.breadth, narrow.breadth)
+        self.assertGreater(broad.fit, narrow.fit)
+        # Secondary, not dominant: breadth alone must not swing E by more than
+        # the role share it is correcting.
+        self.assertLess(broad.fit / narrow.fit, 2.0)
+
+    def test_no_observed_champions_anywhere_scores_zero_breadth(self):
+        self.player(1)
+        fits = player_role_fits(self.repo(), 1)
+
+        for role in ROLE_ORDER:
+            with self.subTest(role=role):
+                self.assertEqual(fits[role].effective_pool, 0.0)
+                self.assertEqual(fits[role].breadth, 0.0)
+                # Equally unsupported everywhere, so this player contributes the
+                # same constant to all 120 permutations and cannot skew them.
+                self.assertEqual(fits[role].fit, MIN_ROLE_FIT)
 
     def test_unplayed_roles_are_floored_not_zero(self):
         self.player(1)
@@ -182,7 +309,9 @@ class RoleFitTests(RoleFixture):
             with self.subTest(role=role):
                 self.assertEqual(fits[role].role_probability, DEFAULT_ROLE_PROBABILITY)
                 self.assertAlmostEqual(fits[role].share, 1.0)
-                self.assertAlmostEqual(fits[role].fit, 1.0)
+                # No observed champions either, so breadth floors E. Still the
+                # same value for every role, which is what "equally" means here.
+                self.assertEqual(fits[role].fit, MIN_ROLE_FIT)
 
     def test_rank_does_not_move_role_fit(self):
         """solo_rank_score is constant across roles, so it must not be in E."""

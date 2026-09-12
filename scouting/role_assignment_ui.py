@@ -104,8 +104,9 @@ def render_matrix_embed(result: RoleAssignmentResult) -> discord.Embed:
     """
     embed = discord.Embed(
         title="🧪 진단 · 5×5 역할 적합도",
-        description=("E = F × R × C · F 해당 포지션 비중 · R 포지션 승률 보정 · "
-                     "C 관측 챔피언 풀 강도\n✅ 는 추천 배치에서 실제로 맡는 자리입니다."),
+        description=("E = F × R × C × B^0.4 · F 해당 포지션 비중 · R 포지션 승률 보정 · "
+                     "C 관측 챔피언 풀 강도 · B 챔피언 폭 · N 유효 챔피언 수\n"
+                     "✅ 는 추천 배치에서 실제로 맡는 자리입니다."),
         color=DIAGNOSTIC_COLOR,
     )
     assigned = {fit.player_id: fit.role for fit in result.best.fits}
@@ -118,6 +119,7 @@ def render_matrix_embed(result: RoleAssignmentResult) -> discord.Embed:
                 f"{mark} {ROLE_LABELS[role]:<{ROLE_WIDTH}} "
                 f"E {_number(fit.fit):>7} F {_number(fit.share):>7} "
                 f"R {_number(fit.winrate_ratio):>7} C {_number(fit.strength):>7} "
+                f"B {_number(fit.breadth):>7} N {fit.effective_pool:>5.2f} "
                 f"{fit.games:>4}경기"
             )
         body = "\n".join(lines)

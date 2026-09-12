@@ -9,8 +9,19 @@ role-comparison factors the ban model has no need for:
     F  role share, how much of this player's history is actually in this role
     R  role win rate versus their own all-role baseline
     C  the ban model's own observed-pool strength in that role
+    B  champion-pool breadth in that role, as an entropy-effective pool size
 
-    E = max(F * R * C, MIN_ROLE_FIT)
+    E = max(F * R * C * B**0.4, MIN_ROLE_FIT)
+
+F is deliberately the strongest term and enters linearly: how often someone
+actually plays a role is the best evidence available about whether they can play
+it. R, C and B are secondary corrections of roughly comparable influence - each
+lands in a band around 0.7-1.2 for realistic inputs - and none of them can
+overturn a large difference in F on its own.
+
+N_REF and the breadth exponent are initial v1 constants, chosen to be eyeballed
+against real diagnostic matrices (which is why both B and raw N_eff are in the
+/assignroles details output). They are not fitted, and nothing here tunes them.
 
 The ban recommender is untouched: nothing here calls `recommend_bans`, and no
 ban candidate, pruning, rho aggregation, KDA or Others computation is redefined.
@@ -45,10 +56,18 @@ ROLE_ORDER = ("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY")
 # Only reached when a player has zero queue 420/400 games in every role, which
 # makes all five roles equally (un)supported rather than all-zero probabilities.
 DEFAULT_ROLE_PROBABILITY = 1.0 / len(ROLE_ORDER)
-# F = (P_role / max P_role) ** this. 1.0 keeps the share penalty linear; a
-# smaller value would flatten it, a larger one would make off-role picks
-# effectively impossible. Placeholder, not tuned.
+# F = (P_role / max P_role), raised to this in E. 1.0 keeps role share the
+# dominant, linear term. Placeholder v1 value, not tuned.
 ROLE_SHARE_EXPONENT = 1.0
+# B raised to this in E. Breadth should matter without dominating: a one-trick
+# is worth less than a comparable player with options, but not half as much.
+# Placeholder v1 value, not tuned.
+ROLE_BREADTH_EXPONENT = 0.4
+# N_REF: the effective pool size that earns full breadth credit. Roughly a v1
+# reading of "a comfortable champion pool for one role" - one champion lands
+# well below 1, about three is moderate, five or more saturates. Placeholder v1
+# value, not tuned.
+BREADTH_REFERENCE_POOL = 5.0
 # Same shrinkage strength the ban model uses for per-champion win rate, applied
 # here to per-role win rate against the player's own all-role baseline.
 ROLE_WR_PRIOR_GAMES = K
@@ -94,6 +113,43 @@ class RoleCandidateModel:
     def strength(self, bans=frozenset()) -> float:
         """C: the unchanged PlayerModel.strength for this role."""
         return self.model.strength(bans)
+
+
+def effective_pool_size(model: PlayerModel) -> float:
+    """N_eff = exp(H) over the role's personal pick distribution.
+
+    Breadth means champions this player has actually been observed picking, so
+    this reads P_personal (the pre-meta-blend share the ban model already
+    computes) and never the Others bucket - Others is a prior over champions
+    nobody has seen them play, which is the opposite of demonstrated breadth.
+
+    One champion gives exp(0) = 1, an even n-champion pool gives n, and an
+    unplayed role gives 0.
+    """
+    shares = [champion.p_personal for champion in model.champions.values()
+              if champion.p_personal > 0]
+    if not shares:
+        return 0.0
+    entropy = -math.fsum(share * math.log(share) for share in shares)
+    return math.exp(entropy)
+
+
+def breadth_score(effective_pool: float) -> float:
+    """B: saturating absolute breadth, comparable ACROSS players.
+
+    B = min(1, log(1 + N_eff) / log(1 + N_REF)), so it answers "is this a real
+    champion pool" on one fixed scale rather than "is this their broadest role".
+    Two players competing for the same role are therefore separated by it, which
+    a per-player normalization could not do - one-tricks would both normalize to
+    1.0 on their own scale.
+
+    Saturating rather than linear: the gap between one champion and three
+    matters far more than the gap between six and eight. An unplayed role
+    (N_eff = 0) scores 0, which is the floor, not a divide-by-zero.
+    """
+    if effective_pool <= 0:
+        return 0.0
+    return min(1.0, math.log1p(effective_pool) / math.log1p(BREADTH_REFERENCE_POOL))
 
 
 def global_baseline_winrate(repo: ScoutingRepo, player_id: int) -> float:
@@ -164,6 +220,8 @@ class RoleFit:
     winrate_adjusted: float  # WR_role_adj
     winrate_ratio: float     # R
     strength: float          # C
+    effective_pool: float    # N_eff
+    breadth: float           # B
     fit: float               # E
 
 
@@ -187,6 +245,10 @@ def player_role_fits(repo: ScoutingRepo, player_id: int) -> dict[str, RoleFit]:
     # Normalizing by the player's own main role makes F a within-player
     # comparison: their best role always scores 1.0, whatever their total games.
     top_probability = max(probabilities.values())
+    # B is NOT normalized within the player: unlike F, breadth is meant to be
+    # comparable between the five players competing for the same role.
+    pools = {role: effective_pool_size(candidate.model)
+             for role, candidate in candidates.items()}
 
     fits = {}
     for role in ROLE_ORDER:
@@ -194,15 +256,20 @@ def player_role_fits(repo: ScoutingRepo, player_id: int) -> dict[str, RoleFit]:
         games, wins = candidate.games_in_role, candidate.wins_in_role
         strength = candidate.strength(frozenset())
         probability = probabilities[role]
-        share = (probability / top_probability) ** ROLE_SHARE_EXPONENT
+        share = probability / top_probability
         winrate_adjusted = (
             (wins + ROLE_WR_PRIOR_GAMES * baseline) / (games + ROLE_WR_PRIOR_GAMES)
         )
         ratio = math.exp(ROLE_WR_SENSITIVITY * (winrate_adjusted - baseline))
+        pool = pools[role]
+        breadth = breadth_score(pool)
+        fit = (share ** ROLE_SHARE_EXPONENT) * ratio * strength * (
+            breadth ** ROLE_BREADTH_EXPONENT
+        )
         fits[role] = RoleFit(
             player_id, candidate.label, role, games, wins, candidate.observed,
-            probability, share, winrate_adjusted, ratio, strength,
-            max(share * ratio * strength, MIN_ROLE_FIT),
+            probability, share, winrate_adjusted, ratio, strength, pool, breadth,
+            max(fit, MIN_ROLE_FIT),
         )
     return fits
 
@@ -282,20 +349,22 @@ def format_assignment(result: RoleAssignmentResult) -> str:
     for fit in result.best.fits:
         lines.append(f"{fit.role:<8} {fit.label} E={fit.fit:.4f} games={fit.games}")
     lines.append("")
-    lines.append("matrix (E / F / R / C / games):")
+    lines.append("matrix (E / F / R / C / B / games):")
     for player_id in result.player_ids:
         lines.append(f"{result.labels[player_id]} baseline={result.baselines[player_id]:.3f}")
         for role in ROLE_ORDER:
             fit = result.matrix[(player_id, role)]
             lines.append(
                 f"  {role:<8} E={fit.fit:.4f} F={fit.share:.4f} R={fit.winrate_ratio:.4f} "
-                f"C={fit.strength:.4f} games={fit.games}"
+                f"C={fit.strength:.4f} B={fit.breadth:.4f} N_eff={fit.effective_pool:.2f} "
+                f"games={fit.games}"
             )
     return "\n".join(lines)
 
 
 __all__ = [
     "ROLE_ORDER", "Assignment", "RoleAssignmentResult", "RoleCandidateModel", "RoleFit",
-    "assign_roles", "build_role_candidate_model", "format_assignment",
-    "global_baseline_winrate", "player_role_fits",
+    "assign_roles", "breadth_score", "build_role_candidate_model",
+    "effective_pool_size", "format_assignment", "global_baseline_winrate",
+    "player_role_fits",
 ]

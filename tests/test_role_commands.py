@@ -80,25 +80,35 @@ class AssignRolesCommandTests(AssignRolesFixture):
         # Each synthetic player mains exactly one role, so the recommendation
         # is the identity mapping.
         recommended = assignment.fields[0].value
+        # Line 0 is the assignment's team fit; the five seats follow it.
         for index, role in enumerate(ROLE_ORDER):
             with self.subTest(role=role):
-                self.assertIn(f"Player{index}#TEST", recommended.splitlines()[index])
+                self.assertIn(f"Player{index}#TEST", recommended.splitlines()[index + 1])
         self.assertLessEqual(len(assignment), 6000)
 
-    async def test_the_concise_response_carries_both_scores_and_the_gap(self):
+    async def test_the_concise_response_carries_both_fits_and_the_gap(self):
         _, channel = await self._run_one()
         embed = channel.send.await_args.kwargs["embeds"][0]
 
         names = [field.name for field in embed.fields]
-        self.assertEqual(names[:3], ["추천 배치", "점수", "차선 배치"])
-        scores = dict(zip(names, (field.value for field in embed.fields)))["점수"]
-        self.assertIn("최적 배치 점수", scores)
-        self.assertIn("차선 배치 점수", scores)
-        self.assertIn("점수 차이", scores)
+        self.assertEqual(names[:3], ["추천 배치", "적합도", "차선 배치"])
+        fields = dict(zip(names, (field.value for field in embed.fields)))
+        scores = fields["적합도"]
+        self.assertIn("최적 배치 팀 적합도 **100.0%**", scores)
+        self.assertIn("차선 배치 팀 적합도", scores)
+        self.assertIn("적합도 차이", scores)
+        # Percentages only out here: raw E and the log scores stay in details.
+        for field in embed.fields:
+            with self.subTest(field=field.name):
+                self.assertNotIn("E ", field.value)
+                self.assertNotIn("sum(log E)", field.value)
+        # Every seat is shown as a share of that player's own best role, and
+        # each synthetic player mains the role they are given.
+        self.assertEqual(fields["추천 배치"].count("개인 적합도 100%"), len(ROLE_ORDER))
         # The runner-up still marks the roles that moved.
-        self.assertIn("↔", dict(zip(names, (f.value for f in embed.fields)))["차선 배치"])
+        self.assertIn("↔", fields["차선 배치"])
 
-    async def test_details_appends_the_full_matrix_unchanged(self):
+    async def test_details_appends_every_role_as_a_personal_fit_percentage(self):
         _, plain_channel = await self._run_one()
         plain = plain_channel.send.await_args.kwargs["embeds"]
 
@@ -113,13 +123,21 @@ class AssignRolesCommandTests(AssignRolesFixture):
         for index, field in enumerate(matrix.fields):
             with self.subTest(player=index):
                 self.assertIn(f"Player{index}#TEST", field.name)
-                # Every cell keeps its E/F/R/C/games values, one line per role.
                 lines = [line for line in field.value.splitlines() if line.startswith(("✅", "  "))]
+                # All five roles, each as a percentage and nothing else - no
+                # raw E, no factors, no game counts anywhere in the embed.
                 self.assertEqual(len(lines), len(ROLE_ORDER))
                 for line in lines:
-                    for factor in ("E ", "F ", "R ", "C ", "B ", "N ", "경기"):
-                        self.assertIn(factor, line)
+                    self.assertRegex(line, r"^(✅|  ) [A-Z]+ +(\d+%|<1%)$")
                 self.assertEqual(sum(line.startswith("✅") for line in lines), 1)
+                # Their own main is 100%, the role they are given here.
+                self.assertRegex(
+                    next(line for line in lines if line.startswith("✅")), r"100%$"
+                )
+        # The line shape above already excludes raw E and its factors; these are
+        # the developer numbers the embed used to carry and must no longer.
+        for raw in ("경기", "sum(log", "N_eff"):
+            self.assertNotIn(raw, str(matrix.to_dict()))
         for embed in embeds:
             with self.subTest(title=embed.title):
                 self.assertLessEqual(len(embed), 6000)

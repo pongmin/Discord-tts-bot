@@ -1,14 +1,21 @@
 """Korean Discord presentation for /assignroles.
 
 Formats an existing RoleAssignmentResult and nothing else: no collection, no DB
-reads, no scoring. The diagnostic matrix is deliberately a second embed rather
-than a page of its own - the recommendation is the answer, the 5x5 grid of
-E/F/R/C is the evidence, and both should be visible without a click.
+reads, no scoring. The 5x5 view is deliberately a second embed rather than a
+page of its own - the recommendation is the answer, each player's fit for the
+four roles they did NOT get is the evidence, and both should be visible without
+a click.
+
+Everything here is a percentage. Raw E and its factors are developer numbers and
+live in `format_assignment` only.
 """
 
 import discord
 
-from scouting.role_assignment import ROLE_ORDER, RoleAssignmentResult, RoleFit
+from scouting.role_assignment import (
+    ROLE_ORDER, Assignment, RoleAssignmentResult, personal_fit_percent,
+    team_fit_percent,
+)
 
 
 ROLE_LABELS = {"TOP": "TOP", "JUNGLE": "JUNGLE", "MIDDLE": "MID",
@@ -22,39 +29,58 @@ CLOSE_CALL_MARGIN = 0.10
 FIELD_LIMIT = 1024
 
 
-def _number(value: float) -> str:
-    """Keep tiny fits readable instead of rendering every one of them as 0.000."""
-    if value and abs(value) < 0.001:
-        return f"{value:.1e}"
-    return f"{value:.3f}"
+def _personal_percent(percent: float) -> str:
+    """Whole percent, except where rounding would read as a flat zero."""
+    if percent and percent < 0.5:
+        return "<1%"
+    return f"{percent:.0f}%"
 
 
-def _assignment_lines(result: RoleAssignmentResult, fits: tuple[RoleFit, ...],
-                      compare: tuple[RoleFit, ...] | None = None) -> str:
-    other = {fit.role: fit.player_id for fit in compare} if compare else {}
-    lines = []
-    for fit in fits:
+def _team_percent(percent: float) -> str:
+    """One decimal: the gap between two good assignments is often under 1pp."""
+    if percent and percent < 0.05:
+        return "<0.1%"
+    return f"{percent:.1f}%"
+
+
+def _assignment_lines(result: RoleAssignmentResult, assignment: Assignment,
+                      compare: Assignment | None = None) -> str:
+    """One line per seat, with the player's own fit for it as a percentage.
+
+    개인 적합도 is E normalized against that player's best role, so 100% means
+    "this is their main" and 44% means "this is a real step down for them" -
+    raw E is kept for the details matrix, where the factors behind it are also
+    visible.
+    """
+    other = {fit.role: fit.player_id for fit in compare.fits} if compare else {}
+    lines = [f"팀 적합도 **{_team_percent(team_fit_percent(result, assignment))}**"]
+    for fit in assignment.fits:
         # ↔ marks the roles where this assignment differs from the other one,
         # which is the whole reason the runner-up is worth showing.
         moved = "↔ " if other and other.get(fit.role) != fit.player_id else ""
         unplayed = " · 무기록" if not fit.observed else ""
         lines.append(
             f"{moved}**{ROLE_LABELS[fit.role]}** — {fit.label} "
-            f"(E {_number(fit.fit)} · {fit.games}경기{unplayed})"
+            f"· 개인 적합도 {_personal_percent(personal_fit_percent(result, fit))} "
+            f"({fit.games}경기{unplayed})"
         )
     return "\n".join(lines)[:FIELD_LIMIT]
 
 
 def _score_text(result: RoleAssignmentResult) -> str:
+    """The two assignments as team fit, best pinned at 100% by construction."""
+    runner_up = team_fit_percent(result, result.runner_up)
     lines = [
-        f"최적 배치 점수 **{result.best.score:.3f}**",
-        f"차선 배치 점수 {result.runner_up.score:.3f}",
-        f"점수 차이 **{result.margin:.3f}**",
+        f"최적 배치 팀 적합도 **{_team_percent(team_fit_percent(result, result.best))}**",
+        f"차선 배치 팀 적합도 {_team_percent(runner_up)}",
+        f"적합도 차이 **{_team_percent(100.0 - runner_up)}p**",
     ]
     if result.margin < CLOSE_CALL_MARGIN:
-        lines.append("두 배치의 점수가 거의 같습니다. 취향대로 골라도 무방합니다.")
+        lines.append("두 배치의 적합도가 거의 같습니다. 취향대로 골라도 무방합니다.")
     else:
-        lines.append("점수는 각 자리 적합도 E의 로그 합이며, 클수록 좋습니다.")
+        lines.append(
+            "팀 적합도는 다섯 자리 적합도의 기하평균을 최적 배치 대비 비율로 나타낸 값입니다."
+        )
     return "\n".join(lines)[:FIELD_LIMIT]
 
 
@@ -82,12 +108,12 @@ def render_assignment_embed(result: RoleAssignmentResult) -> discord.Embed:
         color=EMBED_COLOR,
     )
     embed.add_field(
-        name="추천 배치", value=_assignment_lines(result, result.best.fits), inline=False
+        name="추천 배치", value=_assignment_lines(result, result.best), inline=False
     )
-    embed.add_field(name="점수", value=_score_text(result), inline=False)
+    embed.add_field(name="적합도", value=_score_text(result), inline=False)
     embed.add_field(
         name="차선 배치",
-        value=_assignment_lines(result, result.runner_up.fits, result.best.fits),
+        value=_assignment_lines(result, result.runner_up, result.best),
         inline=False,
     )
     notes = _notes(result)
@@ -97,15 +123,17 @@ def render_assignment_embed(result: RoleAssignmentResult) -> discord.Embed:
 
 
 def render_matrix_embed(result: RoleAssignmentResult) -> discord.Embed:
-    """The full 5x5 diagnostic: every player against every role.
+    """The full 5x5 view: every player against every role, as personal fit %.
 
-    E = F * R * C is shown with its three factors and the raw game count, so a
-    surprising assignment can be traced to whichever factor drove it.
+    Deliberately percentages only. The factors behind E - F, R, C, B, N_eff and
+    the raw game counts - stay in `format_assignment`, the plain-text developer
+    dump, because they answer a model-debugging question rather than the
+    "could this player have gone somewhere else" question this embed is for.
     """
     embed = discord.Embed(
-        title="🧪 진단 · 5×5 역할 적합도",
-        description=("E = F × R × C × B^0.4 · F 해당 포지션 비중 · R 포지션 승률 보정 · "
-                     "C 관측 챔피언 풀 강도 · B 챔피언 폭 · N 유효 챔피언 수\n"
+        title="🧪 선수별 포지션 적합도",
+        description=("각 선수의 개인 적합도입니다. 본인의 최적 포지션이 100%이고, "
+                     "나머지는 그에 대한 비율입니다.\n"
                      "✅ 는 추천 배치에서 실제로 맡는 자리입니다."),
         color=DIAGNOSTIC_COLOR,
     )
@@ -115,12 +143,9 @@ def render_matrix_embed(result: RoleAssignmentResult) -> discord.Embed:
         for role in ROLE_ORDER:
             fit = result.matrix[(player_id, role)]
             mark = "✅" if assigned[player_id] == role else "  "
+            percent = _personal_percent(personal_fit_percent(result, fit))
             lines.append(
-                f"{mark} {ROLE_LABELS[role]:<{ROLE_WIDTH}} "
-                f"E {_number(fit.fit):>7} F {_number(fit.share):>7} "
-                f"R {_number(fit.winrate_ratio):>7} C {_number(fit.strength):>7} "
-                f"B {_number(fit.breadth):>7} N {fit.effective_pool:>5.2f} "
-                f"{fit.games:>4}경기"
+                f"{mark} {ROLE_LABELS[role]:<{ROLE_WIDTH}} {percent:>5}"
             )
         body = "\n".join(lines)
         embed.add_field(

@@ -339,6 +339,48 @@ def assign_roles(repo: ScoutingRepo, player_ids: Sequence[int]) -> RoleAssignmen
     )
 
 
+def personal_fit_percent(result: RoleAssignmentResult, fit: RoleFit) -> float:
+    """Display-only: this role's E as a percentage of the player's best role.
+
+    Answers "how close is this to where they belong", which is the question a
+    reader actually has about a recommended seat - raw E values sit in ranges
+    nobody can calibrate by eye. The player's strongest role is always 100%.
+
+    This normalization is for rendering ONLY. The assignment search keeps using
+    raw E, so it must never be fed back into scoring: dividing by a per-player
+    maximum would erase exactly the cross-player differences that decide who
+    gets a contested role.
+    """
+    best = max(result.fit(fit.player_id, role).fit for role in ROLE_ORDER)
+    if best <= 0:
+        return 0.0
+    return fit.fit / best * 100.0
+
+
+def geometric_mean_fit(assignment: Assignment) -> float:
+    """GM(A) = exp(Score(A) / 5): the log-sum read back as an average E.
+
+    Score is sum(log E) over the five seats, so its exponential per seat is the
+    geometric mean of the five role fits - the same ranking, on a scale that
+    can be compared as a ratio.
+    """
+    return math.exp(assignment.score / len(ROLE_ORDER))
+
+
+def team_fit_percent(result: RoleAssignmentResult, assignment: Assignment) -> float:
+    """Display-only: GM(A) against GM(best), as a percentage.
+
+    The best assignment is 100% by construction and the runner-up shows how
+    little is given up by preferring it - a 96.4% second choice is a real
+    alternative, a 40% one is not. Computed from the score difference directly
+    rather than as a ratio of two exponentials, which keeps it finite for the
+    very small E values MIN_ROLE_FIT allows.
+    """
+    return math.exp(
+        (assignment.score - result.best.score) / len(ROLE_ORDER)
+    ) * 100.0
+
+
 def format_assignment(result: RoleAssignmentResult) -> str:
     """Plain-text dump for manual/debug use; Discord rendering lives elsewhere."""
     lines = [
@@ -365,6 +407,7 @@ def format_assignment(result: RoleAssignmentResult) -> str:
 __all__ = [
     "ROLE_ORDER", "Assignment", "RoleAssignmentResult", "RoleCandidateModel", "RoleFit",
     "assign_roles", "breadth_score", "build_role_candidate_model",
-    "effective_pool_size", "format_assignment", "global_baseline_winrate",
-    "player_role_fits",
+    "effective_pool_size", "format_assignment", "geometric_mean_fit",
+    "global_baseline_winrate", "personal_fit_percent", "player_role_fits",
+    "team_fit_percent",
 ]
